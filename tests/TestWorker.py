@@ -274,6 +274,13 @@ class WorkerTestCase(common.BleachbitTestCase):
         self.assertIsNone(process_cache.last_scan_time)
         self.assertEqual(process_cache.processes, ())
 
+    def test_init_clears_path_spellings(self):
+        """A new worker forgets the path spellings of the last run"""
+        with mock.patch(
+                'bleachbit.FileUtilities.clear_path_spellings') as mock_clear:
+            Worker(CLI.CliCallback(), False, {'test': ['option1']})
+        mock_clear.assert_called_once_with()
+
     def test_format_minutes_remaining(self):
         """Test format_minutes_remaining() for issue #2305"""
         # The placeholder is substituted normally.
@@ -295,6 +302,23 @@ class WorkerTestCase(common.BleachbitTestCase):
                 self.assertIn('Access denied: c:\\access\\denied',
                               log_context.output[0])
                 self.assertNotIn('\\\\', log_context.output[0])
+
+    def test_SymlinkRefusedNoTraceback(self):
+        """Worker logs ELOOP and ENOTDIR refusals without a traceback"""
+        path = self.write_file('test_symlink_refused', b'')
+        for err_no in (errno.ELOOP, errno.ENOTDIR):
+            with self.subTest(errno=err_no):
+                def refuse(p, err_no=err_no):
+                    raise OSError(err_no, os.strerror(err_no), p)
+
+                cmd = Command.Function(path, refuse, 'Test')
+                worker = Worker(CLI.CliCallback(), True, {'test': ['option1']})
+                with self.assertLogs('bleachbit.Worker', level='ERROR') as cm:
+                    list(worker.execute(cmd, 'test.option1'))
+                output = '\n'.join(cm.output)
+                self.assertIn(f'Access denied: {path}', output)
+                self.assertNotIn('Traceback', output)
+                self.assertEqual(worker.total_errors, 1)
 
     def test_DoesNotExist(self):
         """Test Worker using Action.DoesNotExistAction"""

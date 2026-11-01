@@ -17,13 +17,25 @@ from unittest import mock
 from xml.dom.minidom import parseString
 
 import bleachbit
+import bleachbit.FileUtilities
+import bleachbit.Options
 from bleachbit import IS_WINDOWS, IS_POSIX, IS_LINUX, IS_MAC
 from bleachbit.Action import ActionProvider, Command
 from bleachbit.Cleaner import Cleaner, System, backends, create_simple_cleaner, simpler_cleaner_process_path, register_cleaners
-from bleachbit.FileUtilities import extended_path_undo
+from bleachbit.FileUtilities import extended_path, extended_path_undo
 from bleachbit.PathUtils import path_startswith
+from bleachbit.Process import ProcessInfo
 
 from tests import common
+from tests.common import pytest
+
+if IS_WINDOWS:
+    # pylint: disable-next=ungrouped-imports
+    from bleachbit import Windows
+    # pylint: disable-next=ungrouped-imports
+    from tests.TestWindows import WindowsLinksMixIn
+else:
+    WindowsLinksMixIn = object
 
 logger = logging.getLogger('bleachbit')
 
@@ -69,7 +81,7 @@ def register_all_cleaners():
     assert len(backends) > 1
 
 
-class CleanerTestCase(common.BleachbitTestCase):
+class CleanerTestCase(common.BleachbitTestCase, WindowsLinksMixIn):
 
     @classmethod
     def setUpClass(cls):
@@ -205,6 +217,25 @@ class CleanerTestCase(common.BleachbitTestCase):
         self.assertTrue(cleaner.has_action_key('other', 'shred'))
         self.assertFalse(cleaner.has_action_key('opt', 'shred'))
 
+    @common.skipIfWindows
+    def test_is_process_running_lock_symlink(self):
+        """A dangling lock symlink counts only while the user owns its PID"""
+        procs = (ProcessInfo(2, 'kthreadd', False),
+                 ProcessInfo(os.getpid(), 'firefox-esr', True))
+        lock = os.path.join(self.tempdir, 'lock')
+        for target, expected in ((f'127.0.0.1:+{os.getpid()}', True),
+                                 (f'127.0.0.1:+{os.getpid() + 1}', False),
+                                 (f'myhost-{os.getpid()}', True),
+                                 # stale Flatpak lock with a sandbox PID
+                                 ('127.0.0.1:+2', False)):
+            os.symlink(target, lock)
+            cleaner = Cleaner()
+            cleaner.add_running('pathname', lock)
+            with mock.patch('bleachbit.Process.process_cache.get', return_value=procs):
+                self.assertEqual(cleaner.is_process_running(),
+                                 expected, target)
+            os.remove(lock)
+
     def test_auto_hide(self):
         count = 0
         for key in sorted(backends):
@@ -253,6 +284,42 @@ class CleanerTestCase(common.BleachbitTestCase):
 
         for dirname in dirnames:
             self.assertNotExists(dirname)
+
+    @common.skipIfWindows
+    def test_create_simple_cleaner_directory_link(self):
+        """Shredding a link to a directory removes only the link"""
+        target = self.mkdir('csc-link-target')
+        target_file = os.path.join(target, 'file.txt')
+        common.touch_file(target_file)
+        link = os.path.join(self.tempdir, 'csc-link')
+        os.symlink(target, link)
+
+        cleaner = create_simple_cleaner([link])
+        cmds = list(cleaner.get_commands('files'))
+        self.assertEqual([cmd.path for cmd in cmds], [link])
+        for cmd in cmds:
+            list(cmd.execute(True))
+
+        self.assertNotLExists(link)
+        self.assertExists(target_file)
+
+    @common.skipUnlessWindows
+    def test_create_simple_cleaner_junction(self):
+        """Shredding a junction removes only the junction"""
+        target = self.mkdir('csc-junction-target')
+        target_file = os.path.join(target, 'file.txt')
+        common.touch_file(target_file)
+        junction = os.path.join(self.tempdir, 'csc-junction')
+        self._create_win_junction(target, junction)
+
+        cleaner = create_simple_cleaner([junction])
+        cmds = list(cleaner.get_commands('files'))
+        self.assertEqual([cmd.path for cmd in cmds], [junction])
+        for cmd in cmds:
+            list(cmd.execute(True))
+
+        self.assertNotLExists(junction)
+        self.assertExists(target_file)
 
     def test_create_simple_cleaner_refuses_cwd(self):
         """create_simple_cleaner must refuse to shred CWD or its parent."""
@@ -505,11 +572,17 @@ class CleanerTestCase(common.BleachbitTestCase):
     def test_whitelist(self):
         """Unit test for method Cleaner.whitelisted"""
         tests = [
+            ('/tmp/.X0-lock', True),
+            ('/tmp/.X1-lock', True),
+            ('/tmp/.X99-lock', True),
+            ('/tmp/.X-lock', False),
             ('/tmp/.truecrypt_aux_mnt1/control', True),
             ('/tmp/.truecrypt_aux_mnt1/volume', True),
             ('/tmp/.vbox-foo-ipc/lock', True),
             ('/tmp/.wine-500/server-806-102400f/lock', True),
             ('/tmp/gconfd-foo/lock/ior', True),
+            ('/tmp/hsperfdata_foo/1234', True),
+            ('/tmp/hsperfdata_foo', False),
             ('/tmp/ksocket-foo/Arts_SoundServerV2', True),
             ('/tmp/ksocket-foo/secret-cookie', True),
             ('/tmp/orbit-foo/bonobo-activation-register-a9cd6cc4973af098918b154c4957a93f.lock', True),
@@ -560,6 +633,22 @@ class CleanerTestCase(common.BleachbitTestCase):
         from bleachbit.FileUtilities import delete
         delete(obexd_fn, ignore_missing=True)
 
+    @common.skipIfWindows
+    def test_system_cache_mount_point(self):
+        """System cache neither walks nor deletes a mount point below it"""
+        home = self.mkdir('cache-mount-home')
+        cache = self.mkdir(os.path.join(home, '.cache'))
+        cache_file = self.write_file(os.path.join(cache, 'file'))
+        mounted = self.mkdir(os.path.join(cache, 'mounted'))
+        self.write_file(os.path.join(mounted, 'file'))
+
+        with mock.patch('os.path.expanduser',
+                        lambda path: path.replace('~', home, 1)), \
+                mock.patch('bleachbit.FileUtilities._mount_points_below',
+                           return_value={mounted}):
+            paths = [cmd.path for cmd in System().get_commands('cache')]
+        self.assertEqual(paths, [cache_file])
+
     def test_custom(self):
         """Test system.custom"""
         from bleachbit.Options import options
@@ -598,6 +687,162 @@ class CleanerTestCase(common.BleachbitTestCase):
 
         # Restore the original settings.
         options.set_custom_paths(original_custom_paths)
+
+    def test_recycle_bin_keep_list(self):
+        """The recycle bin is not emptied when it holds a kept item"""
+        from bleachbit.Options import options
+        bin_dir = self.mkdtemp()
+        kept = self.write_file(os.path.join(bin_dir, 'kept.docx'))
+        other = self.write_file(os.path.join(bin_dir, 'other.txt'))
+        windows = mock.Mock()
+        windows.get_recycle_bin.return_value = [kept, other]
+        windows.get_recycle_bin_metadata.return_value = None
+        windows.get_recycle_bin_orphaned_metadata.return_value = []
+
+        def get_commands():
+            with mock.patch('bleachbit.Cleaner.IS_WINDOWS', True), \
+                    mock.patch('bleachbit.Cleaner.Windows', windows, create=True):
+                return list(System().get_commands('recycle_bin'))
+
+        options.set_whitelist_paths([('file', kept)])
+        commands = get_commands()
+        self.assertEqual([kept, other], [cmd.path for cmd in commands])
+        self.assertFalse(any(isinstance(cmd, Command.Function)
+                             for cmd in commands))
+
+        options.set_whitelist_paths([])
+        self.assertIsInstance(get_commands()[-1], Command.Function)
+
+    @common.skipUnlessWindows
+    def test_recycle_bin_temp_root(self):
+        """A recycled temp root does not keep the bin from being emptied"""
+        from bleachbit.Options import options
+        recycled = r'C:\$Recycle.Bin\S-1-5-21-1\$RABCDEF'
+        windows = mock.Mock()
+        windows.get_recycle_bin.return_value = [
+            os.path.join(recycled, 'AppData', 'Local', 'Temp'), recycled]
+        windows.get_recycle_bin_metadata.return_value = None
+        windows.get_recycle_bin_orphaned_metadata.return_value = []
+        options.set_whitelist_paths([])
+        with mock.patch('bleachbit.Cleaner.Windows', windows):
+            commands = list(System().get_commands('recycle_bin'))
+        self.assertIsInstance(commands[-1], Command.Function)
+
+    @pytest.mark.no_xdist
+    @pytest.mark.xdist_group('recycle-bin')
+    @common.skipUnlessWindows
+    @common.skipUnlessDestructive
+    def test_recycle_bin_keep_list_destructive(self):
+        """Real bin cleaning preserves kept items, then empties without them."""
+        # pylint: disable=possibly-used-before-assignment
+        self.addCleanup(Windows.empty_recycle_bin, None, True)
+
+        def recycle(path):
+            before = set(Windows.get_recycle_bin())
+            Windows.move_to_recycle_bin(path)
+            added = set(Windows.get_recycle_bin()) - before
+            self.assertTrue(added)
+            recycled = min(added, key=len)
+            metadata = os.path.join(
+                os.path.dirname(recycled), '$I' + os.path.basename(recycled)[2:])
+            self.addCleanup(
+                bleachbit.FileUtilities.delete, metadata, ignore_missing=True)
+            return recycled
+
+        kept = recycle(self.write_file('recycle kept.txt'))
+        other = recycle(self.write_file('recycle other.txt'))
+        kept_folder = self.mkdir('recycle kept folder')
+        self.write_file(os.path.join(kept_folder, 'kept child.txt'))
+        recycled_folder = recycle(kept_folder)
+        kept_child = os.path.join(recycled_folder, 'kept child.txt')
+        folder_metadata = os.path.join(
+            os.path.dirname(recycled_folder), '$I' + os.path.basename(recycled_folder)[2:])
+        other_metadata = os.path.join(
+            os.path.dirname(other), '$I' + os.path.basename(other)[2:])
+        container = self.mkdir('recycle container')
+        temp_root = os.path.join(container, 'AppData', 'Local', 'Temp')
+        os.makedirs(temp_root)
+        self.write_file(os.path.join(temp_root, 'discard.txt'))
+        recycled_container = recycle(container)
+        recycled_temp = os.path.join(
+            recycled_container, 'AppData', 'Local', 'Temp')
+        kept_metadata = os.path.join(
+            os.path.dirname(kept), '$I' + os.path.basename(kept)[2:])
+        self.assertExists(kept_metadata)
+
+        # The shell enumerates ordinary paths even for extended keep entries.
+        bleachbit.Options.options.set_whitelist_paths(
+            [('file', extended_path(kept)), ('file', kept_child)])
+        commands = list(System().get_commands('recycle_bin'))
+        self.assertFalse(any(isinstance(cmd, Command.Function)
+                             for cmd in commands))
+        for cmd in commands:
+            list(cmd.execute(really_delete=False))
+        for path in (kept, other, kept_metadata, other_metadata,
+                     kept_child, folder_metadata):
+            self.assertExists(path)
+        for cmd in commands:
+            list(cmd.execute(really_delete=True))
+        self.assertExists(kept)
+        self.assertExists(kept_metadata)
+        self.assertExists(kept_child)
+        self.assertExists(folder_metadata)
+        self.assertNotExists(other)
+        self.assertNotExists(other_metadata)
+        self.assertExists(recycled_temp)
+
+        bleachbit.Options.options.set_whitelist_paths([])
+        commands = list(System().get_commands('recycle_bin'))
+        self.assertIsInstance(commands[-1], Command.Function)
+        for cmd in commands:
+            list(cmd.execute(really_delete=True))
+        self.assertEqual([], list(Windows.get_recycle_bin()))
+        self.assertNotExists(kept_metadata)
+        self.assertNotExists(folder_metadata)
+        self.assertNotExists(recycled_container)
+
+    @pytest.mark.no_xdist
+    @pytest.mark.xdist_group('recycle-bin')
+    @common.skipUnlessWindows
+    @common.skipUnlessDestructive
+    def test_recycle_bin_orphaned_metadata_destructive(self):
+        """Clean metadata left by earlier runs, but honor payload keep entries."""
+        # pylint: disable=possibly-used-before-assignment
+        self.addCleanup(Windows.empty_recycle_bin, None, True)
+        before = set(Windows.get_recycle_bin())
+        Windows.move_to_recycle_bin(self.write_file('old orphan metadata.txt'))
+        recycled = min(set(Windows.get_recycle_bin()) - before, key=len)
+        metadata = os.path.join(
+            os.path.dirname(recycled), '$I' + os.path.basename(recycled)[2:])
+        self.addCleanup(
+            bleachbit.FileUtilities.delete, metadata, ignore_missing=True)
+        bleachbit.FileUtilities.delete(recycled)
+        self.assertExists(metadata)
+
+        for kept_path in (recycled, metadata):
+            bleachbit.Options.options.set_whitelist_paths(
+                [('file', kept_path)])
+            for cmd in System().get_commands('recycle_bin'):
+                list(cmd.execute(really_delete=True))
+            self.assertExists(metadata)
+
+        bleachbit.Options.options.set_whitelist_paths([])
+        commands = list(System().get_commands('recycle_bin'))
+        for cmd in commands:
+            list(cmd.execute(really_delete=False))
+        self.assertExists(metadata)
+        for cmd in commands:
+            list(cmd.execute(really_delete=True))
+        self.assertNotExists(metadata)
+
+    @pytest.mark.no_xdist
+    @pytest.mark.xdist_group('recycle-bin')
+    @common.skipUnlessWindows
+    @common.skipUnlessDestructive
+    def test_recycle_bin_metadata_shred_destructive(self):
+        """Real bin metadata cleanup also works with shredding enabled."""
+        bleachbit.Options.options.set('shred', True)
+        self.test_recycle_bin_keep_list_destructive()
 
     def test_system_options_platform(self):
         """Test that System cleaner options match the current platform"""

@@ -22,13 +22,22 @@
 Test case for Command
 """
 
+import errno
 import os
 import sqlite3
+import warnings
 from unittest import mock
 
 from tests import common
-from bleachbit import FileUtilities
-from bleachbit.Command import Delete, Function, Shred, Truncate
+import bleachbit.Command
+from bleachbit import FileUtilities, IS_WINDOWS
+from bleachbit.Command import Delete, DeleteRecycleBinMetadata, Function, Shred, Truncate
+from bleachbit.Language import get_text as _
+from bleachbit.Options import options
+
+if not IS_WINDOWS:
+    # pylint: disable-next=redefined-builtin
+    from bleachbit.General import WindowsError
 
 
 class CommandTestCase(common.BleachbitTestCase):
@@ -66,6 +75,139 @@ class CommandTestCase(common.BleachbitTestCase):
             self.assertIsNone(ret['size'])
             self.assertEqual(ret['path'], path)
             self.assertExists(path)
+
+    def test_recycle_bin_metadata(self):
+        """Metadata is previewed, but removed only after its payload is gone."""
+        payload = self.write_file('payload')
+        metadata = self.write_file('metadata')
+        cmd = DeleteRecycleBinMetadata(metadata, payload)
+        preview = list(cmd.execute(False))
+        self.assertEqual([metadata], [ret['path'] for ret in preview])
+        self.assertExists(payload)
+        self.assertExists(metadata)
+        self.assertEqual([], list(cmd.execute(True)))
+        os.remove(payload)
+        results = list(cmd.execute(True))
+        self.assertEqual([metadata], [ret['path'] for ret in results])
+        self.assertNotExists(metadata)
+        self.assertEqual([], list(cmd.execute(True)))
+
+    def test_recycle_bin_metadata_kept_payload(self):
+        """An explicit keep entry also protects an orphaned restore record."""
+        payload = os.path.join(self.tempdir, 'missing payload')
+        metadata = self.write_file('kept metadata')
+        for kept_path in (payload, metadata):
+            options.set_whitelist_paths([('file', kept_path)])
+            results = list(DeleteRecycleBinMetadata(
+                metadata, payload).execute(True))
+            self.assertEqual(0, results[0]['n_deleted'])
+            self.assertExists(metadata)
+
+    def test_recycle_bin_metadata_reappearing_payload(self):
+        """Recheck payload presence at execution, not just at enumeration."""
+        payload = os.path.join(self.tempdir, 'reappearing payload')
+        metadata = self.write_file('reappearing metadata')
+        cmd = DeleteRecycleBinMetadata(metadata, payload)
+        self.write_file(payload)
+        self.assertEqual([], list(cmd.execute(True)))
+        self.assertExists(payload)
+        self.assertExists(metadata)
+
+    def test_recycle_bin_metadata_payload_stat_error(self):
+        """A failed existence check must not be mistaken for a missing payload."""
+        payload = self.write_file('inaccessible payload')
+        metadata = self.write_file('inaccessible metadata')
+        with mock.patch('bleachbit.Command.os.lstat',
+                        side_effect=PermissionError('Access denied')):
+            with self.assertRaises(PermissionError):
+                list(DeleteRecycleBinMetadata(metadata, payload).execute(True))
+        self.assertExists(payload)
+        self.assertExists(metadata)
+
+    def test_recycle_bin_metadata_nonempty_folder(self):
+        """A folder left behind by a kept child retains restore information."""
+        payload = self.mkdir('payload folder')
+        child = self.write_file(os.path.join(payload, 'kept child'))
+        metadata = self.write_file('folder metadata')
+        options.set_whitelist_paths([('file', child)])
+        list(Delete(payload).execute(True))
+        self.assertEqual([], list(
+            DeleteRecycleBinMetadata(metadata, payload).execute(True)))
+        self.assertExists(child)
+        self.assertExists(metadata)
+
+    def test_recycle_bin_metadata_shred(self):
+        """Restore records obey the global shred preference."""
+        payload = os.path.join(self.tempdir, 'shredded payload')
+        metadata = self.write_file('shredded metadata')
+        options.set('shred', True)
+        with mock.patch('bleachbit.FileUtilities.wipe_contents',
+                        wraps=FileUtilities.wipe_contents) as wipe:
+            list(DeleteRecycleBinMetadata(metadata, payload).execute(True))
+        self.assertTrue(wipe.called)
+        self.assertNotExists(metadata)
+
+    def test_delete_dir_left_renamed(self):
+        """Delete raises for a directory it could not rename back"""
+        dirname = self.mkdir('renamed_dir')
+        self.write_file(os.path.join(dirname, 'a_file'), b'content')
+        real_rename = os.rename
+
+        def rename(src, dst, **kwargs):
+            if os.path.basename(dst) == 'renamed_dir':
+                # A sharing violation must not mark the old name for reboot
+                raise OSError(errno.EACCES, 'In use', src, 32)
+            return real_rename(src, dst, **kwargs)
+
+        cmd = Delete(dirname, shred=True)
+        with mock.patch('bleachbit.FileUtilities.is_dir_empty',
+                        return_value=True), \
+                mock.patch('os.rename', side_effect=rename):
+            with self.assertRaises(OSError) as cm:
+                next(cmd.execute(really_delete=True))
+        self.assertExists(os.path.join(cm.exception.filename, 'a_file'))
+
+    def test_Delete_locked_with_shred_option(self):
+        """A locked file is reported as not overwritten when the global
+        shred option is on, as with the Shred command"""
+        path = self.write_file('test_Delete_locked', b'foo')
+        # The overwrite and the delete both failed on a sharing violation
+        if IS_WINDOWS:
+            locked = PermissionError(errno.EACCES, 'locked', path)
+            locked.winerror = 32
+        else:
+            # pylint: disable-next=possibly-used-before-assignment
+            locked = WindowsError(32, 'locked')
+        options.set('shred', True)
+        with mock.patch('bleachbit.FileUtilities.delete', side_effect=locked), \
+                mock.patch.object(bleachbit.Command, 'bleachbit', mock.Mock(),
+                                  create=True) as fake_bleachbit, \
+                warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter('always')
+            ret = next(Delete(path).execute(really_delete=True))
+        fake_bleachbit.Windows.delete_locked_file.assert_called_once_with(
+            FileUtilities.extended_path(path))
+        self.assertEqual(ret['label'], _('Mark for deletion'))
+        self.assertIn(UserWarning, [w.category for w in caught])
+
+    def test_Delete_locked_extended_path(self):
+        """A locked file is flagged for deletion by the same extended
+        path that delete() uses, so a long path is found"""
+        path = self.write_file('test_Delete_locked_extended', b'foo')
+        if IS_WINDOWS:
+            locked = PermissionError(errno.EACCES, 'locked', path)
+            locked.winerror = 32
+        else:
+            # pylint: disable-next=possibly-used-before-assignment
+            locked = WindowsError(32, 'locked')
+        with mock.patch('bleachbit.FileUtilities.delete', side_effect=locked), \
+                mock.patch('bleachbit.FileUtilities.extended_path',
+                           side_effect=lambda p: '\\\\?\\' + p), \
+                mock.patch.object(bleachbit.Command, 'bleachbit', mock.Mock(),
+                                  create=True) as fake_bleachbit:
+            next(Delete(path).execute(really_delete=True))
+        fake_bleachbit.Windows.delete_locked_file.assert_called_once_with(
+            '\\\\?\\' + path)
 
     def test_Function(self):
         """Unit test for Function"""

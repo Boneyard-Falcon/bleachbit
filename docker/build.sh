@@ -14,7 +14,7 @@ Supported distributions:
   debian    - run `make tests` and build .deb packages on Debian
   fedora    - run `make tests` and build RPM/SRPM packages on Fedora
   opensuse  - run `make tests` and build RPM/SRPM packages on openSUSE
-  py314-pytest - run selected tests with Python 3.14 + pytest
+  py315-pytest - run selected tests with Python 3.15 + pytest
 
 Optional environment overrides:
   FEDORA_VERSION   Set Fedora macro used by the spec file
@@ -49,6 +49,10 @@ RUN_ENV=(--env HOME="$HOME_IN_CONTAINER" --env DISTRO_NAME="$DISTRO")
 if [[ -n "${SKIP_TESTS:-}" ]]; then
     RUN_ENV+=(--env SKIP_TESTS="$SKIP_TESTS")
 fi
+# `make stamp` falls back to this when the container lacks git or .git
+# (e.g., the rpmbuild tree extracted from the sdist tarball).
+REVISION=$(cd "$ROOT_DIR" && git rev-parse --short=8 HEAD 2>/dev/null || true)
+RUN_ENV+=(--env REVISION="$REVISION")
 USER_ID=$(id -u)
 GROUP_ID=$(id -g)
 IMAGE=""
@@ -79,9 +83,9 @@ case "$DISTRO" in
         RUN_ENV+=(--env NO_STRIP=1)
         RUN_ENV+=(--env SKIP_APPIMAGE_TEST=1)
         ;;
-    py314-pytest)
-        IMAGE=bleachbit-test:py314-pytest
-        DOCKERFILE="$DOCKER_DIR/Dockerfile.py314-pytest"
+    py315-pytest)
+        IMAGE=bleachbit-test:py315-pytest
+        DOCKERFILE="$DOCKER_DIR/Dockerfile.py315-pytest"
         DOCKER_BUILD_CONTEXT="$ROOT_DIR"
         ;;
     *)

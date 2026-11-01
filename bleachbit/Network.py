@@ -20,9 +20,10 @@ import sys
 import platform
 import warnings
 from collections.abc import Callable
+from urllib.parse import quote
 
 # local imports
-from bleachbit import bleachbit_exe_path, APP_VERSION, ARCH_BITS, General, IS_LINUX, IS_MAC, IS_NETBSD, IS_WINDOWS
+from bleachbit import bleachbit_exe_path, comms_check_url, APP_VERSION, ARCH_BITS, General, IS_LINUX, IS_MAC, IS_NETBSD, IS_WINDOWS
 from bleachbit.FileUtilities import delete, open_for_overwrite
 from bleachbit.General import unset_sslkeylogfile
 from bleachbit.Language import get_active_language_code, get_text as _
@@ -86,14 +87,15 @@ def download_url_to_fn(url, fn, expected_sha512=None, on_error=None,
     msg = _('Downloading URL failed: %s') % url
 
     def do_error(msg2):
+        delete(fn, ignore_missing=True)  # delete any partial download
         if on_error:
             on_error(msg, msg2)
-        delete(fn, ignore_missing=True)  # delete any partial download
 
     try:
         response = fetch_url(url, max_retries=max_retries,
                              backoff_factor=backoff_factor, timeout=timeout)
-    except RequestException as exc:
+    # requests raises a plain OSError for a missing CA bundle
+    except (RequestException, OSError) as exc:
         # For retryable errors (like 503), use a simplified error message
         if HAVE_REQUESTS and isinstance(exc, requests.exceptions.RetryError):
             msg2 = 'Server temporarily unavailable (retries exceeded)'
@@ -114,9 +116,14 @@ def download_url_to_fn(url, fn, expected_sha512=None, on_error=None,
             msg2 = f"SHA-512 mismatch: expected {expected_sha512}, got {hash_actual}"
             do_error(msg2)
             return False
-    General.makedirs(os.path.dirname(fn))
-    with open_for_overwrite(fn, 'wb') as f:
-        f.write(response.content)
+    try:
+        General.makedirs(os.path.dirname(fn))
+        with open_for_overwrite(fn, 'wb') as f:
+            f.write(response.content)
+    except OSError as exc:
+        logger.exception(msg)
+        do_error(f'{type(exc).__name__}: {exc}')
+        return False
     return True
 
 
@@ -146,6 +153,9 @@ def fetch_url(url, max_retries=3, backoff_factor=0.5, timeout=60,
     assert backoff_factor > 0
     assert isinstance(timeout, int)
     assert timeout > 0
+    if not HAVE_REQUESTS:
+        raise RequestException(
+            'The requests package is not installed: network features are disabled.')
     if hasattr(sys, 'frozen'):
         # when frozen by py2exe, certificates are in alternate location
         ca_bundle = os.path.join(bleachbit_exe_path, 'cacert.pem')
@@ -155,9 +165,6 @@ def fetch_url(url, max_retries=3, backoff_factor=0.5, timeout=60,
         else:
             logger.error(
                 'Application is frozen but certificate file not found: %s', ca_bundle)
-    if not HAVE_REQUESTS:
-        raise RequestException(
-            'The requests package is not installed: network features are disabled.')
     assert headers is None or isinstance(headers, dict)
     request_headers = {'User-Agent': get_user_agent()}
     if headers:
@@ -181,6 +188,45 @@ def fetch_url(url, max_retries=3, backoff_factor=0.5, timeout=60,
         response = session.get(url, headers=request_headers,
                                timeout=timeout, verify=True)
     return response
+
+
+COMMS_CHECK_PHRASE = 'STATION CHECK, STANDBY'
+
+
+def comms_check(timeout=15, max_retries=1):
+    """Smoke test the network stack (requests, TLS, and the CA bundle)"""
+    url = f'{comms_check_url}?msg={quote(COMMS_CHECK_PHRASE)}'
+    try:
+        response = fetch_url(url, max_retries=max_retries, timeout=timeout,
+                             headers=get_update_request_headers())
+    except (RequestException, OSError) as exc:
+        req_exc = requests.exceptions if HAVE_REQUESTS else None
+        if req_exc and isinstance(exc, req_exc.Timeout):
+            kind = 'Drop track is jammed.'
+        elif req_exc and isinstance(exc, req_exc.ConnectionError):
+            kind = 'Dropship is offline.'
+        else:
+            kind = "That's it, man. Game over, man. Game over!"
+        print(f'SMOKE TEST FAILED: {kind} ({type(exc).__name__}: {exc})')
+        return 1
+    try:
+        payload = response.json()
+    except ValueError:
+        payload = None
+    if not isinstance(payload, dict):
+        payload = {}
+    speaker = payload.get('speaker')
+    quote_text = payload.get('quote')
+    reply = (f'{speaker}: {quote_text}' if speaker and quote_text
+             else response.text)
+    if response.status_code == 200 and payload.get('status') == 'ok':
+        print(f'SMOKE TEST SUCCESS: {reply}\n'
+              'Express elevator to hell, going down!')
+        return 0
+    logger.error('comms-check returned HTTP %s: %r',
+                 response.status_code, reply[:200])
+    print("SMOKE TEST FAILED: That's it, man. Game over, man. Game over!")
+    return 1
 
 
 def _version_major_minor(version):

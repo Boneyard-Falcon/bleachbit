@@ -6,10 +6,11 @@
 
 import glob
 import os
+import stat
 import sys
 
 import bleachbit
-from bleachbit import APP_NAME, Cleaner, GuiBasic, appicon_path, portable_mode, IS_WINDOWS
+from bleachbit import APP_NAME, Cleaner, FileUtilities, GuiBasic, appicon_path, portable_mode, IS_WINDOWS
 from bleachbit.Cleaner import backends
 from bleachbit.GtkShim import (
     GLib, Gdk, Gio, Gtk,
@@ -39,6 +40,19 @@ if IS_WINDOWS:
 bleachbit.log_startup_time('GuiApplication imported')
 
 
+def _settings_paths(path):
+    """Return path, or the entries in it if it links to a directory"""
+    # Shred the settings but keep the link for init_configuration()
+    # pylint: disable-next=protected-access
+    is_link = stat.S_ISLNK(FileUtilities._file_type(path) or 0)
+    if is_link and os.path.isdir(path):
+        try:
+            return [os.path.join(path, name) for name in os.listdir(path)]
+        except OSError:
+            return []
+    return [path]
+
+
 class Bleachbit(Gtk.Application):
     _window = None
     _shred_paths = None
@@ -54,8 +68,12 @@ class Bleachbit(Gtk.Application):
             application_id_suffix += xdist_worker
         application_id = '{}{}'.format(
             'org.gnome.Bleachbit', application_id_suffix)
+        flags = Gio.ApplicationFlags.FLAGS_NONE
+        if shred_paths:
+            # The paths would never reach an already running instance
+            flags |= Gio.ApplicationFlags.NON_UNIQUE
         Gtk.Application.__init__(
-            self, application_id=application_id, flags=Gio.ApplicationFlags.FLAGS_NONE)
+            self, application_id=application_id, flags=flags)
         GLib.set_prgname('org.bleachbit.BleachBit')
 
         self._font_check_prompt_scheduled = False
@@ -193,11 +211,11 @@ class Bleachbit(Gtk.Application):
             # executables
             paths.append(bleachbit.options_file)
             if os.path.isdir(bleachbit.personal_cleaners_dir):
-                paths.append(bleachbit.personal_cleaners_dir)
+                paths.extend(_settings_paths(bleachbit.personal_cleaners_dir))
             for f in glob.glob(os.path.join(bleachbit.options_dir, "*.bz2")):
                 paths.append(f)
         else:
-            paths.append(bleachbit.options_dir)
+            paths.extend(_settings_paths(bleachbit.options_dir))
 
         # prompt the user to confirm
         if not GUI.shred_paths(self._window, paths, shred_settings=True):
@@ -227,6 +245,8 @@ class Bleachbit(Gtk.Application):
                                       stock_button=button_label)
         if not path:
             # user cancelled
+            return
+        if self._window.refuse_if_busy():
             return
 
         backends['_gui'] = Cleaner.create_wipe_empty_space_cleaner(path)
@@ -282,6 +302,11 @@ class Bleachbit(Gtk.Application):
         bleachbit.log_startup_time('app menu built')
 
     def quit(self, _action=None, _param=None, init_configuration=False):
+        if self._window is None:
+            # Ctrl+C while GUI() runs. Raising stops it before show_all(),
+            # quit() covers a raise swallowed by a GTK callback
+            Gtk.Application.quit(self)
+            raise KeyboardInterrupt
         if init_configuration:
             # After "shred settings and quit", rebuild the minimal configuration.
             # which is important for portable mode.
@@ -342,13 +367,22 @@ class Bleachbit(Gtk.Application):
         dialog.destroy()
 
     def do_activate(self):
-        if not self._window:
-            self._window = GUI(
-                application=self, title=APP_NAME, auto_exit=self._auto_exit)
+        is_first_activation = not self._window
+        if is_first_activation:
+            try:
+                self._window = GUI(
+                    application=self, title=APP_NAME, auto_exit=self._auto_exit)
+            except KeyboardInterrupt:
+                # The half-built window is already in the app's list
+                for window in self.get_windows():
+                    window.destroy()
+                return
         self._window.present()
         if self._shred_paths:
-            GLib.idle_add(GUI.shred_paths, self._window,
-                          self._shred_paths, priority=GLib.PRIORITY_LOW)
+            # A later activation must not shred the same paths again
+            if is_first_activation:
+                GLib.idle_add(GUI.shred_paths, self._window,
+                              self._shred_paths, priority=GLib.PRIORITY_LOW)
             # When we shred paths and auto exit with the Windows Explorer context menu command we close the
             # application in GUI.shred_paths, because if it is closed from here there are problems.
             # Most probably this is something related with how GTK handles idle quit calls.
@@ -360,6 +394,9 @@ class Bleachbit(Gtk.Application):
             # Check for orphaned wipe files from interrupted operations
             GLib.idle_add(self._window.check_orphaned_wipe_files,
                           priority=GLib.PRIORITY_LOW)
+            if IS_WINDOWS:
+                GLib.idle_add(self._window.check_appdata_permissions,
+                              priority=GLib.PRIORITY_LOW)
 
         self._maybe_prompt_font_check()
 

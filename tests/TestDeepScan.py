@@ -10,8 +10,11 @@ Test case for module DeepScan
 """
 
 # standard imports
+import itertools
 import os
 import shutil
+import subprocess
+import unicodedata
 import unittest
 from unittest import mock
 
@@ -24,6 +27,7 @@ from tests.common import SPECIAL_TEST_STRINGS
 from bleachbit import IS_MAC, IS_WINDOWS, FS_CASE_SENSITIVE
 from bleachbit.Options import options
 from bleachbit.DeepScan import DeepScan, Search, normalized_walk
+from bleachbit.FileUtilities import openfiles, whitelisted
 
 if IS_WINDOWS:
     # pylint: disable-next=ungrouped-imports
@@ -73,17 +77,58 @@ class DeepScanTestCase(common.BleachbitTestCase, WindowsLinksMixIn):
             self._test_encoding(test)
 
     def test_DeepScan(self):
-        """Unit test for class DeepScan.  Preview real files."""
-        path = os.path.expanduser('~')
-        searches = {path: []}
-        for regex in ('^Makefile$', '~$', 'bak$', '^Thumbs.db$', '^Thumbs.db:encryptable$'):
-            searches[path].append(Search(command='delete', regex=regex))
-        ds = DeepScan(searches)
-        for cmd in ds.scan():
-            if cmd is True:
-                # it's yielding control to the GTK idle loop
-                continue
-            self.assertLExists(cmd.path)
+        """Unit test for class DeepScan on the kinds of files a home has"""
+        # Not the real home: on CI it holds tool caches and the folders
+        # other workers write to, so its size and contents vary
+        root = self.mkdtemp()
+        sub = os.path.join(root, 'sub')
+        deeper = os.path.join(sub, 'ɡælɪk.dir')
+        os.makedirs(deeper)
+        expected = {
+            self.write_file(os.path.join(root, 'Makefile')),
+            self.write_file(os.path.join(root, 'notes.txt~')),
+            self.write_file(os.path.join(root, 'backup.bak')),
+            self.write_file(os.path.join(sub, 'Thumbs.db')),
+            self.write_file(os.path.join(deeper, 'ɡælɪk.bak')),
+        }
+        for near_miss in ('Makefile.am', '~notes.txt', 'bak.txt'):
+            self.write_file(os.path.join(root, near_miss))
+        self.write_file(os.path.join(sub, 'Thumbs.db.old'))
+        if not IS_WINDOWS:
+            # Windows does not allow a colon in a file name
+            expected.add(self.write_file(
+                os.path.join(sub, 'Thumbs.db:encryptable')))
+            # Not followed, so the files under sub are reported once
+            os.symlink(sub, os.path.join(root, 'link_to_sub'))
+            # A dangling link still matches
+            broken = os.path.join(root, 'broken.bak')
+            os.symlink(os.path.join(root, 'missing'), broken)
+            expected.add(broken)
+            if os.geteuid() != 0:
+                # A folder that cannot be listed is skipped
+                locked = os.path.join(root, 'locked')
+                os.mkdir(locked)
+                self.write_file(os.path.join(locked, 'hidden.bak'))
+                os.chmod(locked, 0)
+                self.addCleanup(os.chmod, locked, 0o700)
+        searches = {root: [
+            Search(command='delete', regex=regex)
+            for regex in ('^Makefile$', '~$', 'bak$', '^Thumbs.db$',
+                          '^Thumbs.db:encryptable$')]}
+        found = []
+        idle_yields = 0
+        with mock.patch('bleachbit.DeepScan.time') as mock_time:
+            # A clock that jumps on every read makes each folder look slow,
+            # so the scan also hands control to the GTK idle loop
+            mock_time.time.side_effect = itertools.count()
+            for cmd in DeepScan(searches).scan():
+                if cmd is True:
+                    idle_yields += 1
+                    continue
+                self.assertLExists(cmd.path)
+                found.append(cmd.path)
+        self.assertCountEqual(expected, found)
+        self.assertGreater(idle_yields, 0)
 
     def test_compiled_search_path_prefix(self):
         """CompiledSearch.match should preserve root path semantics."""
@@ -156,6 +201,67 @@ class DeepScanTestCase(common.BleachbitTestCase, WindowsLinksMixIn):
         self.assertNotIn(keep_file, paths)
         self.assertIn(search_file, paths)
 
+    @common.skipIfWindows
+    def test_scan_skip_open(self):
+        """skip_open leaves files that a process holds open"""
+        root = self.mkdtemp()
+        open_fn = self.write_file(os.path.join(root, 'open.bbtestswp'), b'x')
+        closed_fn = self.write_file(
+            os.path.join(root, 'closed.bbtestswp'), b'x')
+        searches = {root: [
+            Search(command='delete', regex=r'\.bbtestswp$', skip_open=True)]}
+        # Open for reading so FreeBSD reports the path, as in test_open_files
+        with open(open_fn, 'rb'):
+            openfiles.scan()
+            paths = [cmd.path for cmd in DeepScan(
+                searches).scan() if cmd is not True]
+        self.assertEqual(paths, [closed_fn])
+
+    @common.skipIfWindows
+    def test_scan_skip_open_unlisted(self):
+        """skip_open keeps files when open files cannot be listed"""
+        root = self.mkdtemp()
+        self.write_file(os.path.join(root, 'a.bbtestswp'), b'x')
+        # A second match catches a failed listing cached as empty
+        self.write_file(os.path.join(root, 'b.bbtestswp'), b'x')
+        bak_fn = self.write_file(os.path.join(root, 'c.bbtestbak'), b'x')
+        searches = {root: [
+            Search(command='delete', regex=r'\.bbtestswp$', skip_open=True),
+            Search(command='delete', regex=r'\.bbtestbak$')]}
+        for exc in (FileNotFoundError('lsof'),
+                    subprocess.CalledProcessError(1, 'lsof'),
+                    UnicodeDecodeError('utf-8', b'\xff', 0, 1, 'invalid')):
+            with self.subTest(exc=exc), \
+                    mock.patch('bleachbit.FileUtilities.open_files', side_effect=exc), \
+                    mock.patch.object(openfiles, 'last_scan_time', None):
+                paths = [cmd.path for cmd in DeepScan(
+                    searches).scan() if cmd is not True]
+                self.assertEqual(paths, [bak_fn])
+
+    @common.skipIfWindows
+    def test_keep_list_decomposed_name(self):
+        """The macOS deep scan honors a kept file with a decomposed name"""
+        search_dir = self.mkdtemp()
+        # Other tests scan the whole class tempdir
+        self.addCleanup(shutil.rmtree, search_dir)
+        keep_file = self.write_file(os.path.join(
+            search_dir, unicodedata.normalize('NFD', 'r\u00e9sum\u00e9.bbtestbak')))
+        options.set_whitelist_paths([('file', keep_file)])
+        searches = {
+            search_dir: [
+                Search(command='delete', regex=r'\.bbtestbak$')
+            ]
+        }
+        with mock.patch('bleachbit.DeepScan.IS_MAC', True), \
+                mock.patch('bleachbit.FileUtilities.IS_MAC', True):
+            paths = [
+                cmd.path
+                for cmd in DeepScan(searches).scan()
+                if cmd is not True
+            ]
+            self.assertEqual(1, len(paths))
+            self.assertTrue(whitelisted(paths[0]))
+
     @common.skipUnlessWindows
     def test_scan_does_not_follow_junction(self):
         """DeepScan must not descend into a junction"""
@@ -188,8 +294,32 @@ class DeepScanTestCase(common.BleachbitTestCase, WindowsLinksMixIn):
                 nwholeregex = action.get('nwholeregex')
                 break
         self.assertIsNotNone(wholeregex)
-        self.assertIsNotNone(nwholeregex)
         return CompiledSearch(Search(command='delete', wholeregex=wholeregex, nwholeregex=nwholeregex))
+
+    def test_angular_matches_only_cache_dir(self):
+        """.angular option should match the cache folder but not config files."""
+        cs = self._get_compiled_search('angular')
+        matched = [
+            ('/home/u/proj/.angular/cache/19.0.0/babel-webpack', 'x.json'),
+            (r'C:\Users\u\proj\.angular\cache', 'x.json'),
+        ]
+        excluded = [
+            ('/home/u', '.angular-config.json'),
+            ('/home/u/.config/angular', '.angular-config.json'),
+            ('/home/u/proj', '.angular.json'),
+            ('/home/u/proj', '.angular-cli.json'),
+            (r'C:\Users\u', '.angular-config.json'),
+        ]
+        for dirpath, filename in matched:
+            with self.subTest(dirpath=dirpath, filename=filename):
+                self.assertIsNotNone(
+                    cs.match(dirpath, filename),
+                    f"Should match {dirpath}/{filename}")
+        for dirpath, filename in excluded:
+            with self.subTest(dirpath=dirpath, filename=filename):
+                self.assertIsNone(
+                    cs.match(dirpath, filename),
+                    f"Should exclude {dirpath}/{filename}")
 
     def test_node_modules_excludes_dot_dirs(self):
         """node_modules option should exclude system/cache/editor directories."""
@@ -200,6 +330,10 @@ class DeepScanTestCase(common.BleachbitTestCase, WindowsLinksMixIn):
             ('/home/morpheus/.npm/_npx/15b07286cbcc3329/node_modules',
              '.package-lock.json'),
             ('/home/smith/.cache/typescript/5.9/node_modules', '.package-lock.json'),
+            # root's home when running as root, on Linux and macOS
+            ('/root/.nvm/versions/node/v20.11.0/lib/node_modules/npm', 'index.js'),
+            ('/root/.vscode-server/bin/abc/node_modules/foo', 'index.js'),
+            ('/var/root/.nvm/versions/node/v20.11.0/lib/node_modules/npm', 'index.js'),
             (r'C:\Users\glados\.windsurf\extensions\ms-python.python-2026.4.0-universal\out\client\node_modules', 'unicode.js'),
             (r'C:\Users\glados\.cursor\projects\empty-window\canvases\node_modules', 'cursor.js'),
             (r'C:\Users\glados\AppData\Local\Programs\myapp\node_modules', 'file.js'),
@@ -229,6 +363,7 @@ class DeepScanTestCase(common.BleachbitTestCase, WindowsLinksMixIn):
             (r'C:\Users\esnowden\Documents\nsa\prism\node_modules\crypto-js', 'aes.js'),
             (r'C:\Users\chunkylover53\Documents\work-from-home\node_modules\click-button-automator\node_modules\is-buffer', 'index.js'),
             ('/home/chunkylover53/Downloads/donut-radar/node_modules/react-dom', 'bar.js'),
+            ('/root/projects/app/node_modules/react', 'index.js'),
         ]
         for dirpath, filename in matched:
             with self.subTest(dirpath=dirpath, filename=filename):
@@ -246,6 +381,13 @@ class DeepScanTestCase(common.BleachbitTestCase, WindowsLinksMixIn):
             ('/home/username/.local/share/uv/python/cpython-3.12.11-linux-x86_64-gnu/lib/python3.12/venv',
              '__init__.py'),
             ('/home/username/.pyenv/versions/3.12.7/lib/python3.12/venv', '__init__.py'),
+            ('/home/username/miniconda3/lib/python3.12/venv', '__init__.py'),
+            ('/home/username/miniconda3/envs/foo/lib/python3.11/venv/scripts/common',
+             'activate'),
+            ('/home/username/src/cpython/Lib/venv', '__init__.py'),
+            (r'C:\Users\charlie\scoop\apps\python\3.12.4\Lib\venv', '__init__.py'),
+            # tool-managed venvs in root's home
+            ('/root/.local/share/uv/tools/ruff/.venv', 'pyvenv.cfg'),
             # pipx-managed venvs (managed by pipx, like npm cache)
             ('/home/username/.local/share/pipx/venvs/duplicity', 'pyvenv.cfg'),
             # typeshed stubs bundled with editor extensions
@@ -287,6 +429,9 @@ class DeepScanTestCase(common.BleachbitTestCase, WindowsLinksMixIn):
         matched = [
             ('/home/genisys/t800/.venv/yolo-v666', 'pyvenv.cfg'),
             ('/home/stark/jarvis/venv/yolo14', 'pyvenv.cfg'),
+            ('/root/projects/app/.venv', 'pyvenv.cfg'),
+            ('/home/stark/jarvis/venv/lib/python3.12/site-packages/numpy',
+             '__init__.py'),
             (r'C:\Users\esnowden\Documents\nsa\prism\venv', 'pyvenv.cfg'),
         ]
         if IS_WINDOWS:
@@ -305,9 +450,10 @@ class DeepScanTestCase(common.BleachbitTestCase, WindowsLinksMixIn):
         """Delete files in a test environment"""
 
         # make some files
-        f_del = self.write_file('foo.txt.bbtestbak')
-        f_keep = self.write_file('foo.txt')
-        subdir = os.path.join(self.tempdir, 'sub')
+        base = self.mkdtemp()
+        f_del = self.write_file(os.path.join(base, 'foo.txt.bbtestbak'))
+        f_keep = self.write_file(os.path.join(base, 'foo.txt'))
+        subdir = os.path.join(base, 'sub')
         os.mkdir(subdir)
         f_del2 = self.write_file(os.path.join(subdir, 'bar.ini.bbtestbak'))
         f_del3 = self.write_file(os.path.join(subdir, 'bar.ini.bbtestBAK'))
@@ -320,7 +466,7 @@ class DeepScanTestCase(common.BleachbitTestCase, WindowsLinksMixIn):
         # run deep scan
         def run_deep_scan(regex):
             astr = '<action command="{}" search="deep" cache="false" path="{}" {}/>'.format(
-                command, self.tempdir, regex)
+                command, base, regex)
             cleaner = TestCleaner.action_to_cleaner(astr)
             from bleachbit.Worker import backends, Worker
             backends['test'] = cleaner
@@ -331,8 +477,10 @@ class DeepScanTestCase(common.BleachbitTestCase, WindowsLinksMixIn):
             list(worker.run())
             del backends['test']
 
-        # validate results
-        run_deep_scan(r'regex="\.bbtestbak$" wholeregex="sub.*\.bbtestbak$"')
+        # validate results; 'sub' as a path component, as a random
+        # temporary directory name can contain it too
+        run_deep_scan(r'regex="\.bbtestbak$" '
+                      r'wholeregex="[/\\]sub[/\\][^/\\]*\.bbtestbak$"')
         self.assertExists(f_del)
         self.assertExists(f_keep)
         self.assertFalse(os.path.exists(f_del2))
@@ -345,12 +493,6 @@ class DeepScanTestCase(common.BleachbitTestCase, WindowsLinksMixIn):
         run_deep_scan(r'regex="\.bbtestbak$"')
         self.assertFalse(os.path.exists(f_del))
         self.assertExists(f_keep)
-
-        # cleanup
-        os.unlink(f_keep)
-        if FS_CASE_SENSITIVE:
-            os.unlink(f_del3)
-        os.rmdir(subdir)
 
     def test_delete(self):
         self._test_delete('delete')

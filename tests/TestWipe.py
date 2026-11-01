@@ -11,6 +11,7 @@ Test case for module Wipe
 import errno
 import itertools
 import os
+import stat
 import tempfile
 import unittest
 from contextlib import ExitStack
@@ -41,6 +42,22 @@ else:
     from bleachbit.General import WindowsError
 
 
+class _CountingWrite:
+    """write() stub that only counts calls
+
+    A Mock records every call, which is slow for a wipe loop that writes
+    until a size limit.
+    """
+
+    def __init__(self, return_value):
+        self.call_count = 0
+        self.return_value = return_value
+
+    def __call__(self, _data):
+        self.call_count += 1
+        return self.return_value
+
+
 class WipeTestCase(common.BleachbitTestCase):
 
     def test_detect_orphaned_wipe_files(self):
@@ -57,7 +74,7 @@ class WipeTestCase(common.BleachbitTestCase):
             self.assertEqual(orphaned, [])
 
             # Test 2: Create a file that matches criteria
-            # Must start with 'empty_', >100 chars, no extension, contain null bytes
+            # Must start with 'empty_', >100 chars, contain null bytes
             long_suffix = 'a' * 120
             orphan_name = 'empty_' + long_suffix
             orphan_path = os.path.join(self.tempdir, orphan_name)
@@ -68,13 +85,16 @@ class WipeTestCase(common.BleachbitTestCase):
             self.assertEqual(len(orphaned), 1)
             self.assertEqual(orphaned[0], orphan_path)
 
-            # Test 3: File with extension should NOT be detected
-            with_ext_path = os.path.join(self.tempdir, orphan_name + '.txt')
-            with open(with_ext_path, 'wb') as f:
+            # Test 3: A dot is allowed, since the random suffix of a real
+            # wipe file usually contains one
+            with_dot_path = os.path.join(
+                self.tempdir, 'empty_' + 'a' * 60 + '.' + 'a' * 60)
+            with open(with_dot_path, 'wb') as f:
                 f.write(b'\x00' * 1000)
 
             orphaned = detect_orphaned_wipe_files()
-            self.assertEqual(len(orphaned), 1)  # Still just the original
+            self.assertEqual(sorted(orphaned),
+                             sorted([orphan_path, with_dot_path]))
 
             # Test 4: Short filename should NOT be detected
             short_name = 'empty_short'
@@ -83,7 +103,7 @@ class WipeTestCase(common.BleachbitTestCase):
                 f.write(b'\x00' * 1000)
 
             orphaned = detect_orphaned_wipe_files()
-            self.assertEqual(len(orphaned), 1)  # Still just the original
+            self.assertEqual(len(orphaned), 2)  # Still just the two above
 
             # Test 5: File without null bytes should NOT be detected
             no_null_path = os.path.join(self.tempdir, 'empty_' + 'b' * 120)
@@ -91,7 +111,7 @@ class WipeTestCase(common.BleachbitTestCase):
                 f.write(b'x' * 1000)
 
             orphaned = detect_orphaned_wipe_files()
-            self.assertEqual(len(orphaned), 1)  # Still just the original
+            self.assertEqual(len(orphaned), 2)  # Still just the two above
 
         finally:
             # Restore original shred_drives
@@ -115,6 +135,31 @@ class WipeTestCase(common.BleachbitTestCase):
         self.assertEqual(contents, b'\x00' * len(contents))
         self.assertGreaterEqual(len(contents), len(original))
 
+    def test_wipe_write_keeps_size_at_open(self):
+        """wipe_write() must not truncate the file before overwriting it"""
+        original = b'abcdefghij' * 12345
+        filename = self.write_file('wipe_write_in_place', original)
+        sizes = []
+        real_fdopen = os.fdopen
+
+        def fdopen_spy(fd, *args, **kwargs):
+            sizes.append(os.fstat(fd).st_size)
+            return real_fdopen(fd, *args, **kwargs)
+        with mock.patch('bleachbit.Wipe.os.fdopen', side_effect=fdopen_spy):
+            wipe_write(filename).close()
+        self.assertEqual(sizes, [len(original)])
+
+    def test_wipe_write_block_device(self):
+        """wipe_write() fills a block device, for which getsize() is 0"""
+        size = 1024 * 1024 + 1234
+        filename = self.write_file('fake_block_device', b'\xaa' * size)
+        blockdev = mock.Mock(st_mode=stat.S_IFBLK | 0o660)
+        with mock.patch('bleachbit.FileUtilities.getsize', return_value=0), \
+                mock.patch('bleachbit.Wipe.os.fstat', return_value=blockdev):
+            wipe_write(filename).close()
+        with open(filename, 'rb') as f:
+            self.assertEqual(f.read(), b'\x00' * size)
+
     @common.skipIfWindows
     def test_wipe_write_refuses_symlink(self):
         """wipe_write() must not follow a symlink to overwrite its target"""
@@ -125,6 +170,62 @@ class WipeTestCase(common.BleachbitTestCase):
             wipe_write(link)
         with open(target, 'rb') as f:
             self.assertEqual(f.read(), b'keepme' * 100)
+
+    @common.skipIfWindows
+    def test_wipe_write_dir_fd_read_only(self):
+        """wipe_write() with dir_fd changes the mode through a descriptor"""
+        name = 'wipe_write_read_only'
+        filename = self.write_file(name, b'abcdefghij' * 100)
+        os.chmod(filename, 0o400)
+        dir_fd = os.open(self.tempdir, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            with mock.patch('os.chmod', wraps=os.chmod) as mock_chmod:
+                wipe_write(name, dir_fd).close()
+        finally:
+            os.close(dir_fd)
+        if not common.have_root():
+            mock_chmod.assert_called_once()
+        for call in mock_chmod.call_args_list:
+            self.assertIsInstance(call.args[0], int)
+        os.chmod(filename, 0o600)
+        with open(filename, 'rb') as f:
+            contents = f.read()
+        self.assertEqual(contents, b'\x00' * len(contents))
+        self.assertGreaterEqual(len(contents), 1000)
+
+    @common.skipIfWindows
+    def test_wipe_write_dir_fd_unreadable(self):
+        """wipe_write() with dir_fd changes the mode of an unreadable file"""
+        if common.have_root():
+            self.skipTest('root can open any file')
+        name = 'wipe_write_unreadable'
+        original = b'abcdefghij' * 100
+        filename = self.write_file(name, original)
+        os.chmod(filename, 0)
+        dir_fd = os.open(self.tempdir, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            try:
+                os.chmod(name, 0, dir_fd=dir_fd, follow_symlinks=False)
+            except (NotImplementedError, ValueError):
+                # No fchmodat() that skips links, as before glibc 2.32
+                with self.assertRaises(PermissionError):
+                    wipe_write(name, dir_fd)
+                wiped = False
+            else:
+                wipe_write(name, dir_fd).close()
+                wiped = True
+        finally:
+            os.close(dir_fd)
+        self.assertEqual(os.stat(filename).st_mode & 0o777,
+                         0o200 if wiped else 0)
+        os.chmod(filename, 0o600)
+        with open(filename, 'rb') as f:
+            contents = f.read()
+        if wiped:
+            self.assertEqual(contents, b'\x00' * len(contents))
+            self.assertGreaterEqual(len(contents), len(original))
+        else:
+            self.assertEqual(contents, original)
 
     def test_wipe_contents(self):
         """Unit test for wipe_contents()"""
@@ -351,9 +452,16 @@ class WipeTestCase(common.BleachbitTestCase):
         self.assertGreater(counter, 0)
 
     def test_wipe_path_world_writable_warns(self):
-        """wipe_path() warns when the shred drive is world-writable"""
+        """wipe_path() warns when the shred drive is world-writable
+
+        The clock is mocked so the first yield comes after one block
+        instead of after two seconds of filling the disk, which starves
+        the other xdist workers.
+        """
         with mock.patch('bleachbit.Wipe.IS_POSIX', True), \
                 mock.patch('bleachbit.PathUtils.is_world_writable', return_value=True), \
+                mock.patch('bleachbit.Wipe.time.time',
+                           side_effect=itertools.count(0, 3)), \
                 self.assertLogs('bleachbit.Wipe', level='WARNING') as cm:
             for _ret in wipe_path(self.tempdir, True):
                 break
@@ -437,6 +545,27 @@ class WipeTestCase(common.BleachbitTestCase):
         second_suffix = ntf_mock.call_args_list[1][1]['suffix']
         self.assertEqual(len(first_suffix), 185)
         self.assertEqual(len(second_suffix), 180)
+
+    def test_wipe_path_suffix_without_trailing_dot_on_windows(self):
+        """On Windows the temporary file name never ends in a dot
+
+        Windows drops the dot from the name it creates, so deleting
+        f.name afterwards would miss the file.
+        """
+        mock_file = self._make_mock_file()
+        mock_file.write.side_effect = IOError(errno.EFBIG, 'File too large')
+        ntf_mock = mock.Mock(return_value=mock_file)
+        suffixes = iter(['a' * 184 + '.', 'b' * 185])
+        with self._wipe_path_common_mocks() as stack:
+            stack.enter_context(mock.patch('bleachbit.Wipe.IS_WINDOWS', True))
+            stack.enter_context(mock.patch.object(
+                Wipe, '__random_string',
+                side_effect=lambda _length: next(suffixes)))
+            stack.enter_context(mock.patch(
+                'bleachbit.Wipe.tempfile.NamedTemporaryFile', ntf_mock))
+            list(wipe_path(self.tempdir))
+        ntf_mock.assert_called_once()
+        self.assertEqual(ntf_mock.call_args[1]['suffix'], 'b' * 185)
 
     def test_wipe_path_write_enospc(self):
         """Write loop handles ENOSPC by reducing block size"""
@@ -535,7 +664,7 @@ class WipeTestCase(common.BleachbitTestCase):
         for fs_type in ('vfat', 'FAT32'):
             with self.subTest(fs_type=fs_type):
                 mock_file1 = self._make_mock_file()
-                mock_file1.write.return_value = 65536
+                mock_file1.write = _CountingWrite(65536)
                 mock_file2 = self._make_mock_file()
                 mock_file2.write.side_effect = IOError(
                     errno.ENOSPC, 'No space left on device')
@@ -751,4 +880,21 @@ class WipeTestCase(common.BleachbitTestCase):
             list(wipe_path(self.tempdir))
         mock_file.close.assert_called_once()
         stack.delete_mock.assert_called_once_with(
-            mock_file.name, ignore_missing=True)
+            mock_file.name, allow_shred=False, ignore_missing=True)
+
+    def test_wipe_path_abort_does_not_shred(self):
+        """An abort deletes the untruncated wipe file without shredding it"""
+        mock_file = self._make_mock_file()
+        with self._wipe_path_common_mocks() as stack:
+            stack.enter_context(mock.patch(
+                'bleachbit.Wipe.tempfile.NamedTemporaryFile', return_value=mock_file))
+            stack.enter_context(mock.patch(
+                'bleachbit.Wipe.time.time', side_effect=itertools.count(0, 3)))
+            truncate_mock = stack.enter_context(
+                mock.patch('bleachbit.FileUtilities.truncate_f'))
+            gen = wipe_path(self.tempdir, idle=True)
+            next(gen)
+            gen.close()
+        truncate_mock.assert_not_called()
+        stack.delete_mock.assert_called_once_with(
+            mock_file.name, allow_shred=False, ignore_missing=True)

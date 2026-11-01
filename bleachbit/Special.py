@@ -33,6 +33,7 @@ from urllib.parse import quote, urlparse, urlunparse
 
 # local application imports
 from bleachbit import FileUtilities, IS_WINDOWS
+from bleachbit.FileUtilities import SQLITE_BUSY_TIMEOUT
 from bleachbit.General import reject_xml_dtd
 from bleachbit.Options import options
 
@@ -65,7 +66,13 @@ def _sqlite_uri(pathname, mode=None):
     abs_path = os.path.abspath(pathname)
     if IS_WINDOWS:
         abs_path = abs_path.replace('\\', '/')
-    quoted = quote(abs_path, safe='/:')
+    # quote() encodes a str as UTF-8, which may not be the filesystem
+    # encoding and fails on undecodable (surrogate-escaped) bytes.
+    quoted = quote(os.fsencode(abs_path), safe='/:')
+    if quoted.startswith('//'):
+        # An empty authority keeps SQLite from reading the server of a UNC
+        # path as the URI authority, which it rejects.
+        quoted = '//' + quoted
     uri = f'file:{quoted}'
     if mode:
         uri += f'?mode={mode}'
@@ -98,34 +105,36 @@ def sqlite_table_exists(pathname, table):
 
     Returns True if the table exists, False if it does not.
 
-    Raises PermissionError if the file exists but cannot be opened.
+    Raises PermissionError if the file exists but cannot be opened, and
+    sqlite3.OperationalError if it is locked.
     """
     # In FreeBSD, sqlite3 is a separate package
     import sqlite3
     cmd = "select name from sqlite_master where type='table' and name=?;"
     try:
         uri = _sqlite_readonly_uri(pathname)
-        with contextlib.closing(sqlite3.connect(uri, uri=True)) as conn:
+        with contextlib.closing(sqlite3.connect(
+                uri, uri=True, timeout=SQLITE_BUSY_TIMEOUT)) as conn:
             if conn.execute(cmd, (table,)).fetchone():
                 return True
     except sqlite3.OperationalError as exc:
+        if not os.path.exists(pathname):
+            return False
         # SQLITE_CANTOPEN (14) and extended variants are raised when
         # Norton blocks access to browser cookies. The primary code
         # is the low byte.
         # sqlite_errorcode requires Python 3.11+, which is satisfied on
         # Windows where the antivirus issue occurs.
         errorcode = getattr(exc, 'sqlite_errorcode', None)
-        if os.path.exists(pathname) and errorcode is not None and \
-                (errorcode & 0xff) == SQLITE_CANTOPEN:
+        if errorcode is not None and (errorcode & 0xff) == SQLITE_CANTOPEN:
             # Worker shows prettier message for PermissionError
             raise PermissionError(
                 errno.EACCES,
                 f"Cannot open database file (possibly blocked by "
                 f"antivirus or another process): {pathname}",
                 pathname) from exc
-        # Database may be locked, busy, corrupt, or not a valid SQLite DB.
-        logger.debug('sqlite_table_exists: %s: %s', pathname, exc)
-        return False
+        # A locked database is not a missing table
+        raise
     return False
 
 
@@ -134,10 +143,13 @@ def _sqlite_is_valid_database(pathname):
     import sqlite3
     try:
         uri = _sqlite_readonly_uri(pathname)
-        with contextlib.closing(sqlite3.connect(uri, uri=True)) as conn:
+        with contextlib.closing(sqlite3.connect(
+                uri, uri=True, timeout=SQLITE_BUSY_TIMEOUT)) as conn:
             conn.execute('select 1 from sqlite_master limit 1;')
             return True
-    except (sqlite3.DatabaseError, sqlite3.OperationalError):
+    except (sqlite3.DatabaseError, sqlite3.OperationalError) as exc:
+        if str(exc).startswith('database is locked'):
+            raise
         return False
 
 
@@ -171,7 +183,9 @@ def get_sqlite_int(path, sql, parameters=()):
 def _get_sqlite_values(path, sql, row_factory=None, parameters=()):
     """Run SQL on database in 'path' and return the integers"""
     import sqlite3
-    with contextlib.closing(sqlite3.connect(_sqlite_readonly_uri(path), uri=True)) as conn:
+    with contextlib.closing(sqlite3.connect(
+            _sqlite_readonly_uri(path), uri=True,
+            timeout=SQLITE_BUSY_TIMEOUT)) as conn:
         if row_factory is not None:
             conn.row_factory = row_factory
         cursor = conn.execute(sql, parameters)
@@ -294,6 +308,10 @@ def delete_chrome_history(path):
         ids_str = ",".join([str(id0) for id0 in ids_int])
         where = f"where id not in ({ids_str})"
     cmds = __shred_sqlite_char_columns('urls', cols, where, path)
+    if cmds:  # the urls table exists
+        # Reset the visit statistics of the bookmarked URLs kept above, as
+        # for Firefox. last_visit_time is NOT NULL.
+        cmds += "update urls set visit_count=0, typed_count=0, last_visit_time=0;"
     cmds += __shred_sqlite_char_columns('visits', path=path)
     # Google Chrome 79 no longer has lower_term in keyword_search_terms
     cols = ('term',)
@@ -498,12 +516,10 @@ def delete_mozilla_favicons(path):
     # duplication. This is because the first usage of bookmarks
     # is for refining further queries to favicons db and if we
     # first extract the bookmarks as a Python list and give them
-    # to the query we could cause an error in execute_sqlite3 since
-    # it splits the cmds string by ';' and bookmarked url could
-    # contain a ';'. Also if we have a Python list with urls we
-    # need to pay attention to escaping JavaScript strings in some
-    # bookmarks and probably other things. So the safer way for now
-    # is to not compose a query with Python list of extracted urls.
+    # to the query we need to pay attention to escaping JavaScript
+    # strings in some bookmarks and probably other things. So the
+    # safer way for now is to not compose a query with Python list
+    # of extracted urls.
 
     def row_factory(_cursor, row):
         return row[0]

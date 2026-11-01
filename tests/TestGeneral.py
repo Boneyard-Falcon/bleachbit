@@ -305,6 +305,17 @@ class GeneralTestCase(common.BleachbitTestCase):
         # clean up
         shutil.rmtree(os.path.join(self.tempdir, 'just'))
 
+    @common.skipUnlessWindows
+    def test_makedirs_inherits_acl(self):
+        """makedirs leaves the parent's ACL inherited on Windows"""
+        import win32security
+        path = os.path.join(self.mkdtemp(), 'config')
+        makedirs(path)
+        sd = win32security.GetFileSecurity(
+            path, win32security.DACL_SECURITY_INFORMATION)
+        control, _revision = sd.GetSecurityDescriptorControl()
+        self.assertFalse(control & win32security.SE_DACL_PROTECTED)
+
     def test_run_external(self):
         """Unit test for run_external"""
         args = {'nt': ['cmd.exe', '/c', 'dir', r'%windir%\system32', '/s', '/b'],
@@ -367,6 +378,35 @@ class GeneralTestCase(common.BleachbitTestCase):
                     break
                 time.sleep(0.1)
             self.assertExists(output_file)
+
+    @common.skipUnlessLinux
+    def test_run_external_nowait_reaps_child(self):
+        """A detached child is reaped when it exits, not left a zombie"""
+        real_popen = subprocess.Popen
+        started = []
+
+        def popen(*args, **kwargs):
+            # pylint: disable-next=consider-using-with
+            started.append(real_popen(*args, **kwargs))
+            return started[-1]
+
+        with mock.patch('bleachbit.General.subprocess.Popen', side_effect=popen):
+            self.assertTrue(run_external_nowait(['true']))
+        proc_dir = f'/proc/{started[0].pid}'
+        for _ in range(100):
+            if not os.path.exists(proc_dir):
+                break
+            time.sleep(0.05)
+        self.assertNotExists(proc_dir)
+
+    @common.skipIfWindows
+    def test_run_external_nowait_reaper_fails(self):
+        """A reaper thread that cannot start does not rerun the command"""
+        with mock.patch('bleachbit.General.subprocess.Popen') as mock_popen, \
+                mock.patch('bleachbit.General.threading.Thread.start',
+                           side_effect=RuntimeError("can't start new thread")):
+            self.assertEqual(run_external(['true'], wait=False), (0, '', ''))
+        mock_popen.assert_called_once()
 
     @common.skipUnlessWindows
     def test_run_external_nowait_no_kwargs(self):

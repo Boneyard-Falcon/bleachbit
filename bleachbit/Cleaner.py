@@ -13,6 +13,7 @@ import logging
 import os
 import os.path
 import re
+import stat
 import tempfile
 import time
 
@@ -21,7 +22,7 @@ from bleachbit.Language import get_text as _
 from bleachbit.FileUtilities import children_in_directory
 from bleachbit.Options import options
 from bleachbit.PathUtils import path_equal
-from bleachbit.Process import is_process_running
+from bleachbit.Process import is_pid_running, is_process_running
 from bleachbit import Action, CleanerML, Command, FileUtilities, Memory
 from bleachbit import IS_LINUX, IS_MAC, IS_POSIX, IS_WINDOWS
 from bleachbit.GtkShim import gtk_may_be_available
@@ -54,6 +55,20 @@ MENU_DIRS = ('~/.local/share/applications',
              '~/.kde/share/mimelnk/application/ram.desktop',
              '~/.kde2/share/mimelnk/application/',
              '~/.kde2/share/applnk')
+
+
+def _lock_link_is_live(path):
+    """Return whether a dangling lock symlink names a running process
+
+    Gecko links 'IP:+PID' and Chromium 'hostname-PID'. Only the user's own
+    processes count: a Flatpak sandbox PID can be a kernel thread on the host.
+    """
+    try:
+        target = os.readlink(path)
+    except OSError:
+        return False
+    match = re.search(r'[:+-](\d+)$', target)
+    return match is not None and is_pid_running(int(match.group(1)), True)
 
 
 class Cleaner:
@@ -184,7 +199,7 @@ class Cleaner:
             elif 'pathname' == test:
                 expanded = os.path.expanduser(os.path.expandvars(pathname))
                 for globbed in glob.iglob(expanded):
-                    if os.path.exists(globbed):
+                    if os.path.exists(globbed) or _lock_link_is_live(globbed):
                         logger.debug(
                             "file '%s' exists indicating '%s' is running", globbed, self.name)
                         return True
@@ -375,7 +390,9 @@ class System(Cleaner):
             if IS_MAC:
                 dirnames.insert(0, os.path.expanduser("~/Library/Caches/"))
             for dirname in dirnames:
-                for filename in children_in_directory(dirname, True):
+                # Filesystems mounted below it may hold more than cache
+                for filename in children_in_directory(dirname, True,
+                                                      same_device=True):
                     if not self.whitelisted(filename):
                         yield Command.Delete(filename)
 
@@ -517,16 +534,17 @@ class System(Cleaner):
         if IS_POSIX and 'tmp' == option_id:
             dirnames = ['/tmp', '/var/tmp']
             for dirname in dirnames:
-                for path in children_in_directory(dirname, True):
+                # Others can swap in links, and mounts below are not tmp files
+                for path, st in FileUtilities.children_below(
+                        dirname, same_device=True):
                     # is_open() resolves the path and rescans /proc, so leave
                     # it until the cheaper tests have had a chance to reject.
-                    ok = os.path.isfile(path) and \
-                        not os.path.islink(path) and \
-                        FileUtilities.ego_owner(path) and \
+                    ok = stat.S_ISREG(st.st_mode) and \
+                        st.st_uid == os.getuid() and \
                         not self.whitelisted(path) and \
                         not FileUtilities.openfiles.is_open(path)
                     if ok:
-                        yield Command.Delete(path)
+                        yield Command.Delete(path, top=dirname)
 
         # temporary files
         if IS_WINDOWS and 'tmp' == option_id:
@@ -607,9 +625,31 @@ class System(Cleaner):
         if IS_WINDOWS and 'recycle_bin' == option_id:
             # This method allows shredding
             recycled_any = False
+            kept_any = False
+            metadata_paths = set()
             for path in Windows.get_recycle_bin():
                 recycled_any = True
+                # whitelisted() also spares temp roots, which the bin may hold
+                # pylint: disable-next=protected-access
+                temp_root = FileUtilities._windows_preserved_temp_dir(path)
+                if FileUtilities.whitelisted(path) and not temp_root:
+                    kept_any = True
+                metadata = Windows.get_recycle_bin_metadata(path)
+                if metadata and FileUtilities.whitelisted(metadata):
+                    kept_any = True
                 yield Command.Delete(path)
+                if metadata:
+                    metadata_paths.add(os.path.normcase(metadata))
+                    yield Command.DeleteRecycleBinMetadata(metadata, path)
+
+            for metadata, payload in Windows.get_recycle_bin_orphaned_metadata():
+                if os.path.normcase(metadata) in metadata_paths:
+                    continue
+                recycled_any = True
+                if (FileUtilities.whitelisted(metadata)
+                        or FileUtilities.whitelisted(payload)):
+                    kept_any = True
+                yield Command.DeleteRecycleBinMetadata(metadata, payload)
 
             # Windows 10 refreshes the recycle bin icon when the user
             # opens the recycle bin folder.
@@ -626,7 +666,8 @@ class System(Cleaner):
                 yield 0
             # Using the Function Command prevents emptying the recycle bin
             # when in preview mode.
-            if recycled_any:
+            # SHEmptyRecycleBin(NULL) would take the kept items with it
+            if recycled_any and not kept_any:
                 yield Command.Function(None, empty_recycle_bin_func, _('Empty the recycle bin'))
 
         # DNS cache
@@ -645,12 +686,14 @@ class System(Cleaner):
         # re.escape because a home directory may contain regex metacharacters
         home = re.escape(os.path.expanduser('~'))
         regexes = [
-            r'^/tmp/\.X0-lock$',
+            r'^/tmp/\.X[0-9]+-lock$',
             r'^/tmp/\.truecrypt_aux_mnt.*/(control|volume)$',
             r'^/tmp/\.vbox-[^/]+-ipc/lock$',
             r'^/tmp/\.wine-[0-9]+/server-.*/lock$',
             '^/tmp/fsa/',  # fsarchiver
             '^/tmp/gconfd-[^/]+/lock/ior$',
+            # JVM perf data, mapped with no open fd that FreeBSD would list
+            '^/tmp/hsperfdata_[^/]+/',
             '^/tmp/kde-',
             '^/tmp/kdesudo-',
             '^/tmp/ksocket-',
@@ -790,7 +833,9 @@ class CustomFileAction(Action.ActionProvider):
             path = simpler_cleaner_process_path(path)
             if not path:
                 continue
-            if os.path.isdir(path):
+            # Like delete(), shred a link or junction, not its target
+            # pylint: disable-next=protected-access
+            if stat.S_ISDIR(FileUtilities._file_type(path) or 0):
                 for child in children_in_directory(path, True):
                     yield Command.Shred(child)
             yield Command.Shred(path)

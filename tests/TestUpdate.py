@@ -90,7 +90,7 @@ class UpdateTestCase(common.BleachbitTestCase):
             resp.text = xml_text
             resp.content = xml_text.encode()
             mock_fetch.return_value = resp
-            self.assertEqual(check_updates(True, False, None, None), [])
+            self.assertIsNone(check_updates(True, False, None, None))
 
     def test_check_updates_encoding_declaration(self):
         """Update XML with an encoding declaration still parses"""
@@ -118,25 +118,52 @@ class UpdateTestCase(common.BleachbitTestCase):
             updates = check_updates(True, False, None, None)
             self.assertEqual(updates, [('2', 'https://secure.example')])
 
+    def test_check_updates_winapp2_download_fails(self):
+        """A failed winapp2.ini download still returns the update"""
+        xml_text = ('<updates><stable ver="9.9">https://999</stable>'
+                    '<winapp2 url="https://example.invalid/winapp2.ini" '
+                    f'sha512="{"a" * 128}"/></updates>')
+        with patch('bleachbit.Update.fetch_url') as mock_fetch, \
+                patch('bleachbit.Network.fetch_url',
+                      return_value=Mock(status_code=503)):
+            resp = Mock()
+            resp.status_code = 200
+            resp.text = xml_text
+            resp.content = xml_text.encode()
+            mock_fetch.return_value = resp
+            self.assertEqual(check_updates(True, True, print, None),
+                             [('9.9', 'https://999')])
+
+    def test_check_updates_oserror(self):
+        """An OSError from fetch_url (e.g. missing CA bundle) returns None"""
+        with patch('bleachbit.Update.fetch_url',
+                   side_effect=OSError('Could not find a suitable TLS CA certificate bundle')):
+            self.assertIsNone(check_updates(True, True, print, None))
+
     def test_check_updates_real_network(self):
         """Unit test for function check_updates() using real network"""
-        for update in check_updates(True, False, None, None):
+        for update in check_updates(True, False, None, None) or []:
             if not update:
                 continue
             ver, url = update
             self.assertIsInstance(ver, (type(None), str))
             self.assertIsInstance(url, (type(None), str))
 
-    def test_check_updates_bad_url(self):
-        """Unit test for function check_updates() with bad network address"""
-        # expect connection failure
-        preserve_url = bleachbit.update_check_url
-        for url in ('http://localhost/doesnotexist', 'https://httpstat.us/500'):
-            bleachbit.update_check_url = url
-            self.assertEqual(
-                check_updates(True, False, None, None),
-                [])
-        bleachbit.update_check_url = preserve_url
+    # Keep the retries but skip the backoff waits between them
+    @patch('urllib3.util.retry.Retry.sleep')
+    def test_check_updates_bad_url(self, _mock_sleep):
+        """check_updates() returns None on a server error or refused connection"""
+        self.addCleanup(setattr, bleachbit, 'update_check_url',
+                        bleachbit.update_check_url)
+        with common.status_server() as url:
+            bleachbit.update_check_url = url.format(500)
+            self.assertIsNone(check_updates(True, False, None, None))
+            # Refuse at the socket, so the rest of the stack still runs;
+            # Windows is slow to refuse a real localhost connection
+            with patch('urllib3.util.connection.create_connection',
+                       side_effect=ConnectionRefusedError) as mock_connect:
+                self.assertIsNone(check_updates(True, False, None, None))
+            mock_connect.assert_called()
 
     def test_update_url(self):
         """Check that the real update URL returns XML"""

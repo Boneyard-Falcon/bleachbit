@@ -11,9 +11,9 @@ import threading
 import time
 
 import bleachbit
-from bleachbit import APP_NAME, Cleaner, FileUtilities, GuiBasic, Language, appicon_path, windows10_theme_path, IS_MAC, IS_WINDOWS
+from bleachbit import APP_NAME, Cleaner, FileUtilities, GuiBasic, Language, SystemInformation, appicon_path, windows10_theme_path, IS_MAC, IS_WINDOWS
 from bleachbit.Cleaner import backends, register_cleaners
-from bleachbit.Constant import ABORT_BUTTON_LABEL, REQUIRES_EXPERT_MODE
+from bleachbit.Constant import REQUIRES_EXPERT_MODE
 from bleachbit.GUI import logger
 from bleachbit.General import sanitize_surrogates
 from bleachbit.GtkShim import GLib, Gdk, Gio, Gtk, require_gtk
@@ -28,22 +28,6 @@ from bleachbit.Wipe import detect_orphaned_wipe_files
 
 if IS_WINDOWS:
     from bleachbit import Windows
-
-
-# TRANSLATORS: Button label on the headerbar and context menu item
-# in the treeview.
-# 'Preview' is a verb.
-PREVIEW_MSG = _('Preview')
-
-# TRANSLATORS: Button label on the headerbar and context menu item
-# in the treeview.
-# 'Clean' is a verb.
-CLEAN_MSG = _('Clean')
-
-# TRANSLATORS: Button in tree view's context menu to open the cookie
-# manager.
-# Preserve the ellipsis as literal Unicode (…) or as Unicode escape (\u2026).
-MANAGE_COOKIES_TO_KEEP = _("Manage cookies to keep\u2026")
 
 # Ensure GTK is available for this GUI module
 require_gtk()
@@ -73,6 +57,15 @@ class GUI(InfoBarMixin, Gtk.ApplicationWindow):
     _scroll_again = False
     _register_generation = 0
     _app_menu_generation = None
+    _quit_after_worker = False
+    _refresh_pending = False
+    _maximize_pending = False
+    _geometry_ready = False
+    _restore_size = None
+    _restore_size_retried = False
+    _maximize_deadline = 0.0
+    _worker_run = None
+    _worker_source = None
     recognized_cleanerml = False
 
     def __init__(self, auto_exit, *args, **kwargs):
@@ -174,8 +167,10 @@ class GUI(InfoBarMixin, Gtk.ApplicationWindow):
                                   min(geometry.height, 600))
         self.set_position(Gtk.WindowPosition.CENTER)
         self.connect("configure-event", self.on_configure_event)
+        self.connect("size-allocate", self.on_size_allocate)
         self.connect("window-state-event", self.on_window_state_event)
         self.connect("delete-event", self.on_delete_event)
+        self.connect("destroy", self.on_destroy)
         self.connect("show", self.on_show)
 
         if appicon_path and os.path.exists(appicon_path):
@@ -365,6 +360,10 @@ class GUI(InfoBarMixin, Gtk.ApplicationWindow):
             Windows.splash_thread.start()
             return
 
+        # Only Pango's fontconfig backend builds the font cache on startup
+        if os.environ.get('PANGOCAIRO_BACKEND') not in ('fc', 'fontconfig'):
+            return
+
         font_conf_file = Windows.get_font_conf_file()
         if not os.path.exists(font_conf_file):
             logger.error('No fonts.conf file %s', font_conf_file)
@@ -473,14 +472,19 @@ class GUI(InfoBarMixin, Gtk.ApplicationWindow):
         # setting change still waiting on the delayed flush timer
         # (see Options.__schedule_flush) would otherwise be lost if the
         # process exits before that timer fires.
+        self._save_window_geometry()
         options.commit()
         if Gtk.main_level() > 0:
             Gtk.main_quit()
         else:
             self.destroy()
 
+    def _delete_confirmation_required(self):
+        """Return True unless expert mode turned the confirmation off"""
+        return options.get("delete_confirmation") or not options.get('expert_mode')
+
     def _confirm_delete(self, mention_preview, shred_settings=False):
-        if options.get("delete_confirmation") or not options.get('expert_mode'):
+        if self._delete_confirmation_required():
             return GuiBasic.delete_confirmation_dialog(self, mention_preview, shred_settings=shred_settings)
         return True
 
@@ -524,14 +528,17 @@ class GUI(InfoBarMixin, Gtk.ApplicationWindow):
 
         Otherwise, return False to remove from idle queue.
         """
+        if self.refuse_if_busy():
+            return False
         # create a temporary cleaner object
         backends['_gui'] = Cleaner.create_simple_cleaner(paths)
 
         operations = {'_gui': ['files']}
 
         # If no confirmation is requested, skip the preview.
-        if options.get("delete_confirmation"):
+        if self._delete_confirmation_required():
             self.preview_or_run_operations(False, operations)
+            preview = self.worker
             # Set the pending flag before the confirmation dialog because
             # the dialog runs a nested GTK main loop in which the preview
             # worker may finish and call worker_done().  If the flag is set
@@ -540,6 +547,12 @@ class GUI(InfoBarMixin, Gtk.ApplicationWindow):
             self._gui_cleaner_cleanup_pending = self.worker
             if not self._confirm_delete(False, shred_settings):
                 # User dis-confirmed the deletion.
+                return False
+            if self.worker is preview and self._worker_source is not None:
+                # It would write to the delete log and call worker_done()
+                self._stop_worker()
+            elif self.refuse_if_busy():
+                # A reload or another shred started during the dialog
                 return False
             # User confirmed.  If the preview already finished during the
             # confirmation dialog, worker_done() removed _gui from backends.
@@ -555,6 +568,8 @@ class GUI(InfoBarMixin, Gtk.ApplicationWindow):
         # continue with deletion.
         self.preview_or_run_operations(True, operations)
         if shred_settings:
+            # Exiting in worker_done() would skip the caller's config rebuild
+            self._quit_after_worker = True
             return True
 
         if self._auto_exit:
@@ -673,6 +688,19 @@ class GUI(InfoBarMixin, Gtk.ApplicationWindow):
         """
         return self.run_button.get_sensitive()
 
+    def refuse_if_busy(self):
+        """Tell the user and return True if an operation is running
+
+        Call it after the confirmation dialog: a reload can start during it.
+        """
+        if self.run_button_get_sensitive():
+            return False
+        self.show_infobar(
+            # TRANSLATORS: Error message shown in the infobar when the user
+            # starts an operation while another one is running.
+            _("Wait for the current operation to finish."))
+        return True
+
     def run_operations(self, __widget):
         """Event when the 'delete' toolbar button is clicked."""
         # fixme: should present this dialog after finding operations
@@ -680,7 +708,7 @@ class GUI(InfoBarMixin, Gtk.ApplicationWindow):
         # Disable delete confirmation message.
         # if the option is selected under preference.
 
-        if self._confirm_delete(True):
+        if self._confirm_delete(True) and not self.refuse_if_busy():
             self.preview_or_run_operations(True)
 
     def _filter_operations_for_expert_mode(self, operations, really_delete):
@@ -724,6 +752,9 @@ class GUI(InfoBarMixin, Gtk.ApplicationWindow):
         """Preview operations or run operations (delete files)"""
 
         assert isinstance(really_delete, bool)
+        if self._worker_source is not None:
+            self.refuse_if_busy()
+            return
         from bleachbit import Worker
         self.start_time = None
         if not operations:
@@ -752,13 +783,43 @@ class GUI(InfoBarMixin, Gtk.ApplicationWindow):
             self.worker = Worker.Worker(self, really_delete, operations)
         except Exception:
             logger.exception('Error in Worker()')
+            self.set_sensitive(True)
+            self.progressbar.hide()
         else:
             self.start_time = time.time()
-            worker = self.worker.run()
-            GLib.idle_add(worker.__next__)
+            self._worker_run = self.worker.run()
+            self._worker_source = GLib.idle_add(self._step_worker,
+                                                self._worker_run)
+
+    def _step_worker(self, worker_run):
+        """Run the worker up to its next yield"""
+        try:
+            return next(worker_run)
+        except Exception:
+            # PyGObject drops the source after printing the error
+            if worker_run is self._worker_run:
+                self._worker_source = None
+                backends.pop('_gui', None)
+                self._gui_cleaner_cleanup_pending = None
+                self.progressbar.hide()
+                self.set_sensitive(True)
+                if self._refresh_pending:
+                    self._refresh_pending = False
+                    self.cb_refresh_operations()
+            raise
+
+    def _stop_worker(self):
+        """Stop the running worker without letting it finish"""
+        if self._worker_source is None:
+            return
+        GLib.source_remove(self._worker_source)
+        self._worker_source = None
+        self._worker_run.close()
 
     def worker_done(self, worker, really_delete):
         """Callback for when Worker is done"""
+        if worker is self.worker:
+            self._worker_source = None
         # Remove the temporary _gui cleaner used for shred-paths and
         # wipe-empty-space operations, so it does not leak into the tree
         # view on the next refresh. For confirmed deletes, keep it through
@@ -777,12 +838,15 @@ class GUI(InfoBarMixin, Gtk.ApplicationWindow):
         # No scroll here: append_text() has queued one, and scrolling
         # before GTK lays out the new text makes it do that twice.
         self.set_sensitive(True)
+        if self._refresh_pending:
+            self._refresh_pending = False
+            self.cb_refresh_operations()
 
         # Close the program after cleaning is completed.
         # if the option is selected under preference.
 
         if really_delete:
-            if options.get("exit_done"):
+            if options.get("exit_done") and not self._quit_after_worker:
                 sys.exit()
 
         # notification for long-running process
@@ -817,6 +881,10 @@ class GUI(InfoBarMixin, Gtk.ApplicationWindow):
         """Callback to refresh the list of cleaners and header bar labels"""
         if getattr(self, '_destroyed', False) or self.in_destruction():
             return False
+        if self._worker_source is not None:
+            # Registration empties backends, which the worker still reads
+            self._refresh_pending = True
+            return False
         bleachbit.log_startup_time('refresh started')
         # Only the newest registration may advance. A refresh can arrive
         # mid-way, e.g. from Preferences, and two would both fill backends.
@@ -838,6 +906,9 @@ class GUI(InfoBarMixin, Gtk.ApplicationWindow):
                 self.recognized_cleanerml = True
         # reload cleaners from disk
         self.progressbar.show()
+        # The tree shows stale rows until backends is refilled
+        self.set_sensitive(False)
+        self.stop_button.set_sensitive(False)
         rc = register_cleaners(self.update_progress_bar,
                                self.cb_register_cleaners_done,
                                allow_local=allow_local)
@@ -846,7 +917,14 @@ class GUI(InfoBarMixin, Gtk.ApplicationWindow):
             if generation != self._register_generation:
                 rc.close()
                 return False
-            return next(rc)
+            try:
+                return next(rc)
+            except Exception:
+                if generation == self._register_generation:
+                    self.progressbar.hide()
+                    if self._worker_source is None:
+                        self.set_sensitive(True)
+                raise
 
         GLib.idle_add(pump)
         return False
@@ -855,6 +933,9 @@ class GUI(InfoBarMixin, Gtk.ApplicationWindow):
         """Called from register_cleaners()"""
         bleachbit.log_startup_time('cleaners registered')
         self.progressbar.hide()
+        # A running worker re-enables the window when it is done
+        if self._worker_source is None:
+            self.set_sensitive(True)
         # update tree view
         self.tree_store.refresh_rows()
         # expand tree view
@@ -900,7 +981,8 @@ class GUI(InfoBarMixin, Gtk.ApplicationWindow):
 
         # preview
         if not really_delete:
-            self.preview_or_run_operations(False, operations)
+            if not self.refuse_if_busy():
+                self.preview_or_run_operations(False, operations)
             return
 
         # block cleaning of warning options without expert mode
@@ -909,7 +991,7 @@ class GUI(InfoBarMixin, Gtk.ApplicationWindow):
             return
 
         # delete
-        if self._confirm_delete(False):
+        if self._confirm_delete(False) and not self.refuse_if_busy():
             self.preview_or_run_operations(True, operations)
             return
 
@@ -950,11 +1032,11 @@ class GUI(InfoBarMixin, Gtk.ApplicationWindow):
         # make a menu
         menu = Gtk.Menu()
         menu.connect('hide', lambda widget: widget.detach())
-        preview_item = Gtk.MenuItem(label=PREVIEW_MSG)
+        preview_item = Gtk.MenuItem(label=_('Preview'))
         preview_item.connect('activate', self.cb_run_option,
                              False, cleaner_id, option_id)
         menu.append(preview_item)
-        clean_item = Gtk.MenuItem(label=CLEAN_MSG)
+        clean_item = Gtk.MenuItem(label=_('Clean'))
         clean_item.connect('activate', self.cb_run_option,
                            True, cleaner_id, option_id)
         menu.append(clean_item)
@@ -962,7 +1044,10 @@ class GUI(InfoBarMixin, Gtk.ApplicationWindow):
         # Check if this option has a cookie command
         if self._option_has_cookie_command(cleaner_id, option_id):
             menu.append(Gtk.SeparatorMenuItem())
-            cookie_item = Gtk.MenuItem(label=MANAGE_COOKIES_TO_KEEP)
+            # TRANSLATORS: Button in tree view's context menu to open the cookie
+            # manager.
+            # Preserve the ellipsis as literal Unicode (…) or as Unicode escape (\u2026).
+            cookie_item = Gtk.MenuItem(label=_("Manage cookies to keep\u2026"))
             cookie_item.connect('activate', self.cb_manage_cookies)
             menu.append(cookie_item)
 
@@ -987,7 +1072,9 @@ class GUI(InfoBarMixin, Gtk.ApplicationWindow):
             if info == 80:
                 uris = data.get_uris()
                 paths = FileUtilities.uris_to_paths(uris)
-                self.shred_paths(paths)
+                # uris_to_paths() logs the URIs it skipped
+                if paths:
+                    self.shred_paths(paths)
             # GtkTextView installs its own ::drag-data-received handler that
             # calls gtk_drag_finish(FALSE) when the view is not editable. On
             # Wayland that tears down the data offer in addition to the
@@ -1073,7 +1160,10 @@ class GUI(InfoBarMixin, Gtk.ApplicationWindow):
             self._reload_app_menu()
 
         # Preview button
-        self.preview_button.set_label(PREVIEW_MSG)
+        # TRANSLATORS: Button label on the headerbar and context menu item
+        # in the treeview.
+        # 'Preview' is a verb.
+        self.preview_button.set_label(_('Preview'))
         self.preview_button.set_tooltip_text(
             # TRANSLATORS: Tooltip for the preview button on the headerbar.
             # 'Preview' is a verb, and 'selected operations' refers to
@@ -1081,14 +1171,17 @@ class GUI(InfoBarMixin, Gtk.ApplicationWindow):
             _("Preview files in the selected operations (without deleting any files)"))
 
         # Clean button
-        self.run_button.set_label(CLEAN_MSG)
+        # TRANSLATORS: Button label on the headerbar and context menu item
+        # in the treeview.
+        # 'Clean' is a verb.
+        self.run_button.set_label(_('Clean'))
         self.run_button.set_tooltip_text(
             # TRANSLATORS: Tooltip for the clean button on the headerbar.
             # 'Clean' is a verb, and 'operations' are cleaning options (e.g.,
             #  Firefox - Cache).
             _("Clean files in the selected operations"))
 
-        self.stop_button.set_label(ABORT_BUTTON_LABEL)
+        self.stop_button.set_label(_('Abort'))
         self.stop_button.set_tooltip_text(
             # TRANSLATORS: Tooltip for the abort button on the headerbar,
             # and 'abort' ia a verb.
@@ -1228,23 +1321,71 @@ class GUI(InfoBarMixin, Gtk.ApplicationWindow):
         self.menu_button.set_menu_model(builder.get_object('app-menu'))
         self._app_menu_generation = generation
 
+    _TILING_STATES = (Gdk.WindowState.TILED |
+                      Gdk.WindowState.TOP_TILED |
+                      Gdk.WindowState.RIGHT_TILED |
+                      Gdk.WindowState.BOTTOM_TILED |
+                      Gdk.WindowState.LEFT_TILED)
+
+    @staticmethod
+    def _parse_window_state(state):
+        """Return (maximized, fullscreen) for a Gdk.WindowState bitmask"""
+        is_tiled = state & GUI._TILING_STATES != 0
+        fullscreen = (state & Gdk.WindowState.FULLSCREEN != 0) and not is_tiled
+        maximized = state & Gdk.WindowState.MAXIMIZED != 0
+        return maximized, fullscreen
+
     def on_configure_event(self, _widget, _event):
         (x, y) = self.get_position()
         (width, height) = self.get_size()
 
+        window = self.get_window()
+        if window is not None:
+            maximized, fullscreen = self._parse_window_state(
+                window.get_state())
+        else:
+            maximized = False
+            fullscreen = False
+
         # fixup maximized window position:
         # on Windows if a window is maximized on a secondary monitor it is moved off the screen
-        if IS_WINDOWS:
-            window = self.get_window()
-            if window.get_state() & Gdk.WindowState.MAXIMIZED != 0:
-                g = get_window_info(self)
-                if x < g.x or x >= g.x + g.width or y < g.y or y >= g.y + g.height:
-                    logger.debug("Maximized window %s+%s: %s",
-                                 (x, y), (width, height), str(g))
-                    self.move(g.x, g.y)
-                    return True
+        if IS_WINDOWS and maximized:
+            g = get_window_info(self)
+            if x < g.x or x >= g.x + g.width or y < g.y or y >= g.y + g.height:
+                logger.debug("Maximized window %s+%s: %s",
+                             (x, y), (width, height), str(g))
+                self.move(g.x, g.y)
+                return True
 
-        # save window position and size
+        # Keep the normal geometry for when the window is restored.
+        if maximized or fullscreen or self._maximize_pending:
+            return False
+
+        # Only the position: see on_size_allocate() for the size.
+        options.set("window_x", x)
+        options.set("window_y", y)
+        return False
+
+    def on_size_allocate(self, _widget, _allocation):
+        """Save the window size
+
+        With client-side decorations, get_size() subtracts the decoration
+        extents of the previous window state until GTK lays out the window
+        again. After unmaximize, configure-event and idle callbacks can
+        see the size inflated by the shadow width, and no further
+        configure-event follows when the extents are corrected.
+        """
+        self._save_window_geometry()
+
+    def _save_window_geometry(self):
+        window = self.get_window()
+        if window is None or not self._geometry_ready:
+            return False
+        maximized, fullscreen = self._parse_window_state(window.get_state())
+        if maximized or fullscreen or self._maximize_pending:
+            return False
+        (x, y) = self.get_position()
+        (width, height) = self.get_size()
         options.set("window_x", x)
         options.set("window_y", y)
         options.set("window_width", width)
@@ -1260,18 +1401,14 @@ class GUI(InfoBarMixin, Gtk.ApplicationWindow):
           full screen nor maximized.
 
         Because of this issue, we check the tiling state.
-        """
-        tiling_states = (Gdk.WindowState.TILED |
-                         Gdk.WindowState.TOP_TILED |
-                         Gdk.WindowState.RIGHT_TILED |
-                         Gdk.WindowState.BOTTOM_TILED |
-                         Gdk.WindowState.LEFT_TILED)
 
-        is_tiled = event.new_window_state & tiling_states != 0
-        fullscreen = (event.new_window_state &
-                      Gdk.WindowState.FULLSCREEN != 0) and not is_tiled
+        The options saved here restore the state on the next start.
+        on_configure_event() instead reads the live Gdk.Window state,
+        so it is not affected by these reporting quirks.
+        """
+        maximized, fullscreen = self._parse_window_state(
+            event.new_window_state)
         options.set("window_fullscreen", fullscreen)
-        maximized = event.new_window_state & Gdk.WindowState.MAXIMIZED != 0
         options.set("window_maximized", maximized)
         if IS_WINDOWS:
             logger.debug(
@@ -1280,8 +1417,13 @@ class GUI(InfoBarMixin, Gtk.ApplicationWindow):
 
     def on_delete_event(self, _widget, _event):
         # commit options to disk
+        self._save_window_geometry()
         options.close()
         return False
+
+    def on_destroy(self, _widget):
+        """Stop the running operation so it does not outlive the window"""
+        self._stop_worker()
 
     def on_show(self, _widget):
         """Handle the show event.
@@ -1295,7 +1437,14 @@ class GUI(InfoBarMixin, Gtk.ApplicationWindow):
             Windows.splash_thread.join(0)
 
         # restore window position, size and state
+        # GTK allocates the window before this handler runs, so saving
+        # waits until the remembered geometry has been read.
+        self._geometry_ready = False
+        self._maximize_pending = False
+        self._restore_size = None
+        self._restore_size_retried = False
         if not options.get('remember_geometry'):
+            self._geometry_ready = True
             return
         if options.has_option("window_x") and options.has_option("window_y") and \
            options.has_option("window_width") and options.has_option("window_height"):
@@ -1308,23 +1457,53 @@ class GUI(InfoBarMixin, Gtk.ApplicationWindow):
 
             # only restore position and size if window left corner
             # is within the closest monitor
-            if r.x >= g.x and r.x < g.x + g.width and \
-               r.y >= g.y and r.y < g.y + g.height:
+            if g.x <= r.x < g.x + g.width and \
+               g.y <= r.y < g.y + g.height:
                 logger.debug("closest monitor %s, prior window geometry = %s+%s",
                              str(g), (r.x, r.y), (r.width, r.height))
+                self._restore_size = (r.width, r.height)
                 self.move(r.x, r.y)
                 self.resize(r.width, r.height)
+                self.check_resize()
         if options.get("window_fullscreen"):
             self.fullscreen()
             self.append_text(
                 # TRANSLATORS: Hint shown when starting in fullscreen mode.
                 _("Press F11 to exit fullscreen mode.") + '\n')
         elif options.get("window_maximized"):
-            self.maximize()
+            # maximize() asks the window manager for the restore rectangle
+            # immediately. Defer maximizing to the next idle so the restored
+            # size configure event has already landed.
+            self._maximize_pending = True
+            self._maximize_deadline = time.monotonic() + 0.5
+            GLib.idle_add(self._maximize_after_restore)
+        self._geometry_ready = True
 
         # Apply Windows 10 theme if on Windows and enabled
         if IS_WINDOWS:
             self.set_windows10_theme()
+
+    def _maximize_after_restore(self):
+        """Maximize once the restored size has been applied.
+
+        The map-time state event clears the saved maximized flag before
+        this runs, so the flag must not be read again here.
+        """
+        if self.get_window() is None:
+            self._maximize_pending = False
+            return False
+        self.check_resize()
+        if self._restore_size is not None and self.get_size() != self._restore_size:
+            if not self._restore_size_retried:
+                self._restore_size_retried = True
+                self.resize(*self._restore_size)
+                self.check_resize()
+            if (self.get_size() != self._restore_size and
+                    time.monotonic() < self._maximize_deadline):
+                return True
+        self._maximize_pending = False
+        self.maximize()
+        return False
 
     def check_orphaned_wipe_files(self):
         """Check for orphaned wipe files and offer to delete them.
@@ -1374,30 +1553,97 @@ class GUI(InfoBarMixin, Gtk.ApplicationWindow):
             self.shred_paths(orphaned_files)
         return False
 
+    def check_appdata_permissions(self):
+        """Check for broken %APPDATA%\\BleachBit permissions and offer to fix them."""
+        # pylint: disable-next=possibly-used-before-assignment
+        if not IS_WINDOWS or not Windows.shell.IsUserAnAdmin():
+            return False
+
+        def _worker():
+            try:
+                has_broken_acl = Windows.has_broken_appdata_acl()
+            except Exception:
+                logger.exception(
+                    'Error checking configuration folder permissions')
+                return
+            if has_broken_acl:
+                GLib.idle_add(self._prompt_appdata_permissions)
+
+        threading.Thread(target=_worker, daemon=True).start()
+        return False
+
+    def _prompt_appdata_permissions(self):
+        """Ask whether to repair %APPDATA%\\BleachBit permissions, on the main thread."""
+        if self.textbuffer is None:
+            # window was destroyed while the check was running
+            return False
+
+        # TRANSLATORS: This message is shown on Windows when the configuration
+        # folder (%APPDATA%\BleachBit) has broken file permissions that prevent
+        # non-administrator processes from accessing it. %s is the folder path.
+        msg = _("BleachBit detected a permissions issue with its configuration "
+                "folder (%s). Would you like to repair it?") % bleachbit.options_dir
+
+        # TRANSLATORS: Title of confirmation dialog for repairing folder permissions.
+        title = _("Confirm")
+        resp = GuiBasic.message_dialog(self,
+                                       msg,
+                                       Gtk.MessageType.WARNING,
+                                       Gtk.ButtonsType.YES_NO,
+                                       title)
+
+        if resp == Gtk.ResponseType.YES:
+            repaired = False
+            try:
+                # pylint: disable-next=possibly-used-before-assignment
+                Windows.fix_appdata_acl()
+                # The reset is a no-op if the parent folder's ACL is
+                # itself broken, so verify instead of assuming success.
+                repaired = not Windows.has_broken_appdata_acl()
+            except Exception:
+                logger.exception(
+                    'Error repairing permissions for %s', bleachbit.options_dir)
+            if repaired:
+                self.append_text(
+                    # TRANSLATORS: Message shown in the log after repairing
+                    # folder permissions. %s is the folder path.
+                    _("Repaired permissions for %s.") % bleachbit.options_dir + '\n')
+            else:
+                self.append_text(
+                    # TRANSLATORS: Message shown in the log when repairing
+                    # folder permissions did not fully succeed. %s is the
+                    # folder path.
+                    _("Could not fully repair permissions for %s.")
+                    % bleachbit.options_dir + '\n')
+        return False
+
     @threaded
     def check_online_updates(self):
         """Check for software updates in background"""
         # TRANSLATORS: Error message shown when checking for updates fails.
         # %s is the error details.
         log_msg = _("Error when checking for updates: %s")
+        updates = None
         try:
             from bleachbit import Update
-        except ImportError as e:
-            logger.error(log_msg, e)
-            return
-        try:
             updates = Update.check_updates(options.get('check_beta'),
                                            options.get('update_winapp2'),
                                            self.append_text,
                                            lambda: GLib.idle_add(self.cb_refresh_operations))
-
+        except ImportError as e:
+            logger.error(log_msg, e)
         except Exception as e:
             logger.exception(log_msg, e)
-        else:
+        if updates is not None:
             self._available_updates = updates
 
             def update_button_state():
-                if updates:
+                if updates and self.textbuffer is not None:
                     self.update_button.show()
-                    self.set_sensitive(True)
             GLib.idle_add(update_button_state)
+        else:
+            # The online update check failed, so fall back to the
+            # offline outdated-build notice.
+            notice = SystemInformation.get_outdated_build_notice()
+            if notice:
+                GLib.idle_add(self.append_text, notice + '\n')

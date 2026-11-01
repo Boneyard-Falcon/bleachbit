@@ -81,6 +81,8 @@ if IS_WINDOWS:
 logger = logging.getLogger(__name__)
 
 IO_REPARSE_TAG_MOUNT_POINT = 0xA0000003
+# IsReparseTagNameSurrogate(): set for symlinks and junctions
+IO_REPARSE_TAG_NAME_SURROGATE = 0x20000000
 FILE_ATTRIBUTE_REPARSE_POINT = 0x400
 
 SPLASH_ICON_SIZE_PX = 256  # 256x256 pixels
@@ -278,13 +280,19 @@ def browse_files(_, title):
 
 def browse_folder(_, title):
     """Ask the user to select a folder.  Return full path."""
-    flags = 0x0010  # SHBrowseForFolder path input
+    # pylint: disable-next=possibly-used-before-assignment
+    flags = shellcon.BIF_RETURNONLYFSDIRS | shellcon.BIF_EDITBOX
     # pylint: disable-next=possibly-used-before-assignment
     pidl = shell.SHBrowseForFolder(None, None, title, flags)[0]
     if pidl is None:
         # user cancelled
         return None
-    return shell.SHGetPathFromIDListW(pidl)
+    try:
+        return shell.SHGetPathFromIDListW(pidl)
+    except pywintypes.com_error:
+        # a virtual folder such as This PC, or a path over MAX_PATH
+        logger.exception('exception in browse_folder()')
+        return None
 
 
 def cleanup_nonce():
@@ -294,7 +302,14 @@ def cleanup_nonce():
         # and deletes shared %TEMP% files with a %TEMP% parent lock, racing
         # other workers.
         return
+    # Like the tmp cleaner, keep recent ones another instance may still use
+    max_age_seconds = 7 * 24 * 60 * 60
     for fn in glob.glob(os.path.expandvars(r'%TEMP%\gdbus-nonce-file-*')):
+        try:
+            if time.time() - os.stat(fn).st_mtime < max_age_seconds:
+                continue
+        except OSError:
+            continue
         logger.debug('cleaning GTK nonce file: %s', fn)
         FileUtilities.delete(fn)
 
@@ -374,10 +389,31 @@ def _close_delete_parent_lock():
     if _delete_parent_lock_handle is not None:
         logger.debug('Closing parent lock handle for %s',
                      _delete_parent_lock_key)
-        # pylint: disable-next=possibly-used-before-assignment
-        win32file.CloseHandle(_delete_parent_lock_handle)
+        # Forget it first, so a handle that fails to close is not retried
+        handle = _delete_parent_lock_handle
         _delete_parent_lock_handle = None
         _delete_parent_lock_key = None
+        # pylint: disable-next=possibly-used-before-assignment
+        win32file.CloseHandle(handle)
+
+
+def _check_delete_parent(handle, pathname):
+    """Refuse the parent locked by handle if it is a symlink or junction"""
+    try:
+        info = win32file.GetFileInformationByHandleEx(
+            handle, win32file.FileAttributeTagInfo)
+        attrs = info['FileAttributes']
+        is_link = info['ReparseTag'] & IO_REPARSE_TAG_NAME_SURROGATE
+    except pywintypes.error as e:
+        # Some devices have no tag (invalid function/parameter, not supported)
+        if e.winerror not in (1, 50, 87):
+            raise
+        attrs = win32file.GetFileInformationByHandle(handle)[0]
+        is_link = True
+    if attrs & FILE_ATTRIBUTE_REPARSE_POINT and is_link:
+        raise OSError(errno.EACCES,
+                      "Refusing to delete through a directory link",
+                      pathname)
 
 
 def _lock_delete_parent(pathname):
@@ -395,16 +431,25 @@ def _lock_delete_parent(pathname):
     parent_key = os.path.normcase(parent)
     if _delete_parent_lock_handle is not None and _delete_parent_lock_key == parent_key:
         logger.debug('Reusing parent lock handle for %s', parent_key)
+        # The lock does not stop an empty parent becoming a junction
+        try:
+            _check_delete_parent(_delete_parent_lock_handle, pathname)
+        except Exception:
+            _close_delete_parent_lock()
+            raise
         return
     _close_delete_parent_lock()
     flags = win32con.FILE_FLAG_BACKUP_SEMANTICS | getattr(
         win32con, 'FILE_FLAG_OPEN_REPARSE_POINT', 0x00200000)
-    access = getattr(win32con, 'FILE_READ_ATTRIBUTES', 0x80)
+    # Share modes do not apply to attribute-only opens, so also list it
+    access = getattr(win32con, 'FILE_LIST_DIRECTORY', 0x1) | getattr(
+        win32con, 'FILE_READ_ATTRIBUTES', 0x80)
     try:
         handle = win32file.CreateFile(
             parent,
             access,
-            win32con.FILE_SHARE_READ,
+            # No delete sharing, so it cannot be renamed, but its entries can
+            win32con.FILE_SHARE_READ | win32con.FILE_SHARE_WRITE,
             None,
             win32con.OPEN_EXISTING,
             flags,
@@ -418,15 +463,10 @@ def _lock_delete_parent(pathname):
                       "Access denied locking directory before delete()",
                       pathname)
     try:
-        attrs = win32file.GetFileAttributesW(parent)
-    except pywintypes.error:
+        _check_delete_parent(handle, pathname)
+    except Exception:
         win32file.CloseHandle(handle)
         raise
-    if attrs & FILE_ATTRIBUTE_REPARSE_POINT:
-        win32file.CloseHandle(handle)
-        raise OSError(errno.EACCES,
-                      "Refusing to delete through a directory link",
-                      pathname)
     logger.debug('Opened parent lock handle for %s', parent_key)
     _delete_parent_lock_handle = handle
     _delete_parent_lock_key = parent_key
@@ -482,13 +522,17 @@ def delete_registry_value(key, value_name, really_delete):
     successful.  If really_delete is False (meaning preview),
     just check whether the value exists."""
     (hive, sub_key) = split_registry_key(key)
+    # Without KEY_WOW64_64KEY, WOW64 would send the x86 build's
+    # HKLM\Software to WOW6432Node. Elsewhere the flag changes nothing.
     try:
         if really_delete:
             # pylint: disable-next=possibly-used-before-assignment
-            hkey = winreg.OpenKey(hive, sub_key, 0, winreg.KEY_SET_VALUE)
+            hkey = winreg.OpenKey(
+                hive, sub_key, 0, winreg.KEY_SET_VALUE | winreg.KEY_WOW64_64KEY)
             winreg.DeleteValue(hkey, value_name)
         else:
-            hkey = winreg.OpenKey(hive, sub_key)
+            hkey = winreg.OpenKey(
+                hive, sub_key, 0, winreg.KEY_READ | winreg.KEY_WOW64_64KEY)
             winreg.QueryValueEx(hkey, value_name)
     except PermissionError as e:
         raise OSError(
@@ -524,20 +568,22 @@ def delete_registry_key(parent_key, really_delete, excludekeys=None):
             return False
 
     (hive, parent_sub_key) = split_registry_key(parent_key)
-    hkey = None
     try:
-        hkey = winreg.OpenKey(hive, parent_sub_key)
+        hkey = winreg.OpenKey(
+            hive, parent_sub_key, 0, winreg.KEY_READ | winreg.KEY_WOW64_64KEY)
+    except PermissionError as e:
+        raise OSError(
+            errno.EACCES,
+            "Access denied in delete_registry_key()", parent_key) from e
     # WindowsError is a real builtin; this file only runs on Windows.
     # pylint: disable-next=undefined-variable
     except WindowsError as e:
         if e.winerror == 2:
             # 2 = 'file not found' happens when key does not exist
             return False
+        raise
     if not really_delete:
         return True
-    if not hkey:
-        # key not found
-        return False
     keys_size = winreg.QueryInfoKey(hkey)[0]
     child_keys = [
         parent_key + '\\' + winreg.EnumKey(hkey, i) for i in range(keys_size)
@@ -557,7 +603,7 @@ def delete_registry_key(parent_key, really_delete, excludekeys=None):
         return False
 
     try:
-        winreg.DeleteKey(hive, parent_sub_key)
+        winreg.DeleteKeyEx(hive, parent_sub_key, winreg.KEY_WOW64_64KEY)
     except PermissionError as e:
         raise OSError(
             errno.EACCES,
@@ -717,19 +763,19 @@ def detect_registry_key(parent_key):
     except UnicodeEncodeError:
         return False
     (hive, parent_sub_key) = split_registry_key(parent_key)
-    hkey = None
-    try:
-        hkey = winreg.OpenKey(hive, parent_sub_key)
-    # WindowsError is a real builtin; this file only runs on Windows.
-    # pylint: disable-next=undefined-variable
-    except WindowsError as e:
-        if e.winerror == 2:
-            # 2 = 'file not found' happens when key does not exist
+    # A 32-bit app's HKLM\Software key is only in the 32-bit view
+    for view in (winreg.KEY_WOW64_64KEY, winreg.KEY_WOW64_32KEY):
+        try:
+            winreg.OpenKey(hive, parent_sub_key, 0, winreg.KEY_READ | view)
+        # WindowsError is a real builtin; this file only runs on Windows.
+        # pylint: disable-next=undefined-variable
+        except WindowsError as e:
+            if e.winerror == 2:
+                # 2 = 'file not found' happens when key does not exist
+                continue
             return False
-    if not hkey:
-        # key not found
-        return False
-    return True
+        return True
+    return False
 
 
 def get_sid_token_48():
@@ -820,8 +866,10 @@ def elevate_privileges(uac):
     except pywintypes.error as e:
         if 1223 == e.winerror:
             logger.debug('user denied the UAC dialog')
-            return False
-        raise
+        else:
+            # e.g., a policy that denies elevation, or Appinfo disabled
+            logger.warning('failed to elevate privileges: %s', e)
+        return False
 
     logger.debug('ShellExecuteEx=%s', rc)
 
@@ -837,6 +885,134 @@ def _add_command_line_parameters(parameters):
     # parameters already has --gui, so drop it from argv to avoid a duplicate
     args = [arg for arg in sys.argv[1:] if arg != '--gui']
     return subprocess.list2cmdline(parameters + args)
+
+
+def _current_user_sid():
+    """Return the PySID of the user running this process."""
+    token = win32security.OpenProcessToken(
+        win32api.GetCurrentProcess(), win32security.TOKEN_QUERY)
+    try:
+        return win32security.GetTokenInformation(
+            token, win32security.TokenUser)[0]
+    finally:
+        win32api.CloseHandle(token)
+
+
+def _is_path_acl_broken(path, user_sid):
+    """Return True if an OWNER RIGHTS ACE on path locks out user_sid, or
+    its ACL cannot be read."""
+    try:
+        sd = win32security.GetFileSecurity(
+            path, win32security.DACL_SECURITY_INFORMATION |
+            win32security.OWNER_SECURITY_INFORMATION)
+    except pywintypes.error as exc:
+        if getattr(exc, 'winerror', None) == 5:  # ERROR_ACCESS_DENIED
+            return True
+        raise
+    if sd.GetSecurityDescriptorOwner() == user_sid:
+        return False
+    dacl = sd.GetSecurityDescriptorDacl()
+    if dacl is None:
+        return False
+    owner_rights_sid = win32security.ConvertStringSidToSid('S-1-3-4')
+    return any(dacl.GetAce(i)[2] == owner_rights_sid
+               for i in range(dacl.GetAceCount()))
+
+
+def _is_single_link_file(path):
+    """Return True if path is not a hard link."""
+    try:
+        return os.lstat(path).st_nlink == 1
+    except OSError:
+        return False
+
+
+def _appdata_acl_targets(options_dir):
+    """Yield options_dir, the files directly in it, and the cleaners subtree.
+
+    Symlinks, junctions, and hard-linked files are skipped.
+    """
+    yield options_dir
+    try:
+        entries = list(os.scandir(options_dir))
+    except OSError:
+        return
+    for entry in entries:
+        if entry.is_symlink():
+            continue
+        if entry.is_file(follow_symlinks=False) and _is_single_link_file(entry.path):
+            yield entry.path
+    cleaners_dir = os.path.join(options_dir, 'cleaners')
+    if os.path.isdir(cleaners_dir) and not os.path.islink(cleaners_dir):
+        yield cleaners_dir
+        for root, dirs, files in os.walk(cleaners_dir, followlinks=False):
+            for name in dirs:
+                target = os.path.join(root, name)
+                if not os.path.islink(target):
+                    yield target
+            for name in files:
+                target = os.path.join(root, name)
+                if not os.path.islink(target) and _is_single_link_file(target):
+                    yield target
+
+
+def has_broken_appdata_acl(options_dir=None, user_sid=None):
+    """Return True if options_dir (or a child) locks out user_sid.
+
+    Before commit c3007aa0e818e905abb3dcb3035cb3dd40b715d1, General.makedirs()
+    called os.mkdir(path, 0o700), which on Windows sets a protected DACL with
+    an OWNER RIGHTS ACE. If an elevated process created the directory, its
+    owner is Administrators, and non-elevated processes are locked out
+    (issue #2401). A 0o700 directory owned by the user works, so it is not
+    flagged.
+
+    user_sid defaults to the user running this process.
+    """
+    if not IS_WINDOWS:
+        return False
+    if options_dir is None:
+        if bleachbit.portable_mode:
+            return False
+        options_dir = bleachbit.options_dir
+    if not options_dir or not os.path.exists(options_dir) or os.path.islink(options_dir):
+        return False
+    if user_sid is None:
+        user_sid = _current_user_sid()
+    for target in _appdata_acl_targets(options_dir):
+        if _is_path_acl_broken(target, user_sid):
+            return True
+    return False
+
+
+def fix_appdata_acl(options_dir=None):
+    """Reset the DACL on options_dir and its children to inherit from the parent.
+
+    Equivalent to ``icacls "%APPDATA%\\BleachBit" /reset /T``.
+    """
+    if not IS_WINDOWS:
+        return
+    if options_dir is None:
+        if bleachbit.portable_mode:
+            return
+        options_dir = bleachbit.options_dir
+    if not options_dir or not os.path.exists(options_dir) or os.path.islink(options_dir):
+        return
+    empty_dacl = win32security.ACL()
+    flags = (win32security.DACL_SECURITY_INFORMATION |
+             win32security.UNPROTECTED_DACL_SECURITY_INFORMATION)
+    failed = []
+    for target in _appdata_acl_targets(options_dir):
+        try:
+            win32security.SetNamedSecurityInfo(
+                target, win32security.SE_FILE_OBJECT, flags,
+                None, None, empty_dacl, None)
+        except Exception:
+            failed.append(target)
+            logger.exception('Error resetting ACL on %s', target)
+    if failed:
+        raise OSError(
+            f'Failed to reset ACL on {len(failed)} path(s), '
+            f'first: {failed[0]}')
 
 
 def empty_recycle_bin(path, really_delete):
@@ -990,6 +1166,46 @@ def get_known_folder_path(folder_name):
     path = pPath.value
     _CoTaskMemFree(pPath)
     return path
+
+
+def get_recycle_bin_metadata(path):
+    """Return the metadata sibling of a top-level recycled payload, if any."""
+    path = FileUtilities.extended_path_undo(os.path.normpath(path))
+    drive, tail = os.path.splitdrive(path)
+    parts = tail.split(os.sep)
+    if not drive or len(parts) != 4:
+        return None
+    if (parts[0] == ''
+            and parts[1].lower() == '$recycle.bin'
+            and parts[2][:2].lower() == 's-'
+            and parts[3][:2].lower() == '$r'):
+        return os.path.join(os.path.dirname(path), '$I' + parts[3][2:])
+    return None
+
+
+def get_recycle_bin_orphaned_metadata():
+    """Yield (metadata, payload) for this user's old orphaned bin records."""
+    sid = win32security.ConvertSidToStringSid(_current_user_sid())
+    for drive in get_fixed_drives():
+        bin_dir = os.path.join(drive, '$Recycle.Bin')
+        user_dir = os.path.join(bin_dir, sid)
+        if (not FileUtilities.is_normal_directory(bin_dir)
+                or not FileUtilities.is_normal_directory(user_dir)):
+            continue
+        try:
+            with os.scandir(FileUtilities.extended_path(user_dir)) as entries:
+                for entry in entries:
+                    if (entry.name[:2].lower() != '$i'
+                            or not entry.is_file(follow_symlinks=False)):
+                        continue
+                    payload = os.path.join(user_dir, '$R' + entry.name[2:])
+                    try:
+                        os.lstat(FileUtilities.extended_path(payload))
+                    except FileNotFoundError:
+                        yield os.path.join(user_dir, entry.name), payload
+        except OSError:
+            logger.debug('Cannot inspect recycle-bin metadata in %s',
+                         user_dir, exc_info=True)
 
 
 def get_recycle_bin():
@@ -1248,7 +1464,8 @@ def read_registry_key(full_key, value_name):
     except RuntimeError:
         return None
     try:
-        with winreg.OpenKey(hive, sub_key, 0, winreg.KEY_QUERY_VALUE) as hkey:
+        with winreg.OpenKey(hive, sub_key, 0,
+                            winreg.KEY_QUERY_VALUE | winreg.KEY_WOW64_64KEY) as hkey:
             (reg_value, reg_type) = winreg.QueryValueEx(hkey, value_name)
             if reg_type in (winreg.REG_EXPAND_SZ, winreg.REG_SZ):
                 return reg_value

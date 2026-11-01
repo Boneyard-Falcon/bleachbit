@@ -16,6 +16,7 @@ import errno
 import itertools
 import json
 import locale
+import mmap
 import os
 import sqlite3
 import stat
@@ -23,7 +24,9 @@ import subprocess
 import sys
 import tempfile
 import time
+import unicodedata
 import unittest.mock
+import urllib.parse
 import warnings
 
 # third-party import
@@ -34,16 +37,19 @@ from tests.common import pytest
 
 # local import
 from bleachbit.FileUtilities import (
+    _mount_points_below,
+    _posix_keep_list_spelling,
     _remove_windows_readonly,
     _truncate_locked_file,
     bytes_to_human,
+    children_below,
     children_in_directory,
+    clear_path_spellings,
     clean_ini,
     clean_json,
     delete_file,
     delete,
     detect_encoding,
-    ego_owner,
     exe_exists,
     execute_sqlite3,
     exists_in_path,
@@ -62,6 +68,7 @@ from bleachbit.FileUtilities import (
     is_hard_link,
     is_normal_directory,
     listdir,
+    open_files_linux,
     open_files_lsof,
     open_files_psutil,
     open_files_freebsd,
@@ -74,12 +81,13 @@ from bleachbit.FileUtilities import (
 )
 from bleachbit.General import gc_collect, run_external
 from bleachbit.Options import init_configuration, options
-from bleachbit import logger, FS_CASE_SENSITIVE, IS_FREEBSD, IS_LINUX, IS_POSIX, IS_WINDOWS
+from bleachbit import logger, FS_CASE_SENSITIVE, IS_FREEBSD, IS_LINUX, IS_MAC, IS_POSIX, IS_WINDOWS
 
 
 if IS_WINDOWS:
     from bleachbit import Windows
     # pylint: disable=import-error
+    import pywintypes
     import win32api
     import win32com.shell
     import win32con
@@ -593,6 +601,182 @@ class FileUtilitiesTestCase(common.BleachbitTestCase, WindowsLinksMixIn):
         self.assertEqual(entries_files_only, [real_file])
         self.assertEqual(len(entries_files_only), 1)
 
+    @common.skipIfWindows
+    def test_children_below_path_max(self):
+        """children_below() skips paths as long as PC_PATH_MAX"""
+        top = self.mkdir('children-below-path-max')
+        sub = self.mkdir(os.path.join(top, 'd'))
+        kept = [self.write_file(os.path.join(top, 'f')),
+                self.write_file(os.path.join(sub, 'f'))]
+        long_dir = self.mkdir(os.path.join(top, 'long-dir'))
+        skipped = [self.write_file(os.path.join(sub, 'ff')),
+                   self.write_file(os.path.join(long_dir, 'f'))]
+
+        path_max = len(os.fsencode(os.path.join(sub, 'ff')))
+        with unittest.mock.patch('os.pathconf', return_value=path_max):
+            self.assertCountEqual(dict(children_below(top)), kept)
+        for fallback in ({'return_value': -1}, {'side_effect': OSError}):
+            with unittest.mock.patch('os.pathconf', **fallback):
+                self.assertCountEqual(dict(children_below(top)),
+                                      kept + skipped)
+
+    @common.skipIfWindows
+    def test_children_below(self):
+        """children_below() lists non-directories and never enters a link"""
+        top = self.mkdtemp()
+        real_file = self.write_file(os.path.join(top, 'file'), b'abc')
+        nested = self.mkdir(os.path.join(top, 'sub', 'nested'))
+        nested_file = self.write_file(os.path.join(nested, 'nested-file'))
+        outside = self.mkdtemp()
+        self.write_file(os.path.join(outside, 'outside-file'))
+        dir_link = os.path.join(top, 'dir-link')
+        os.symlink(outside, dir_link)
+
+        found = dict(children_below(top))
+        self.assertCountEqual(found, [real_file, nested_file, dir_link])
+        self.assertTrue(stat.S_ISREG(found[real_file].st_mode))
+        self.assertEqual(found[real_file].st_size, 3)
+        self.assertTrue(stat.S_ISLNK(found[dir_link].st_mode))
+
+    @common.skipIfWindows
+    def test_children_below_deep(self):
+        """children_below() holds no descriptor per directory level"""
+        top = self.mkdir('children-below-deep')
+        deep = self.mkdir(os.path.join(top, *['d'] * 20))
+        path = self.write_file(os.path.join(deep, 'f'))
+        real_open, real_close = os.open, os.close
+        open_fds = set()
+        peak = 0
+
+        def counting_open(*args, **kwargs):
+            nonlocal peak
+            fd = real_open(*args, **kwargs)
+            open_fds.add(fd)
+            peak = max(peak, len(open_fds))
+            return fd
+
+        def counting_close(fd):
+            open_fds.discard(fd)
+            real_close(fd)
+
+        with unittest.mock.patch('os.open', side_effect=counting_open), \
+                unittest.mock.patch('os.close', side_effect=counting_close):
+            self.assertEqual(list(dict(children_below(top))), [path])
+        self.assertEqual(open_fds, set())
+        self.assertLessEqual(peak, 2)
+
+    @common.skipIfWindows
+    def test_mount_points_below(self):
+        """_mount_points_below() reads mounts below dirname from mountinfo"""
+        top = self.mkdir('mount-points-below')
+        real = os.path.realpath(top)
+        mountinfo = ('22 1 8:1 / / rw - ext4 /dev/sda1 rw\n'
+                     f'30 22 0:40 / {real} rw - tmpfs tmpfs rw\n'
+                     f'31 30 8:1 /srv {real}/bind rw - ext4 /dev/sda1 rw\n'
+                     f'32 30 0:41 / {real}/a\\040b rw - tmpfs tmpfs rw\n'
+                     f'33 22 0:42 / {real}-sibling rw - tmpfs tmpfs rw\n')
+        with unittest.mock.patch('bleachbit.FileUtilities.IS_LINUX', True):
+            with unittest.mock.patch(
+                    'bleachbit.FileUtilities.open', create=True,
+                    new=unittest.mock.mock_open(read_data=mountinfo.encode())):
+                self.assertEqual(_mount_points_below(top),
+                                 {os.path.join(top, 'bind'),
+                                  os.path.join(top, 'a b')})
+            with unittest.mock.patch('bleachbit.FileUtilities.open',
+                                     create=True, side_effect=OSError):
+                self.assertEqual(_mount_points_below(top), set())
+        with unittest.mock.patch('bleachbit.FileUtilities.IS_LINUX', False):
+            self.assertEqual(_mount_points_below(top), set())
+
+    @common.skipIfWindows
+    def test_children_same_device_mount_table(self):
+        """same_device also skips a bind mount, which keeps st_dev"""
+        top = self.mkdir('children-mount-table')
+        top_file = self.write_file(os.path.join(top, 'file'))
+        bind = self.mkdir(os.path.join(top, 'bind'))
+        bind_file = self.write_file(os.path.join(bind, 'file'))
+        # A file can be bind-mounted onto another file
+        file_bind = self.write_file(os.path.join(top, 'file-bind'))
+
+        with unittest.mock.patch('bleachbit.FileUtilities._mount_points_below',
+                                 return_value={bind, file_bind}):
+            self.assertEqual(list(dict(children_below(top, same_device=True))),
+                             [top_file])
+            self.assertEqual(list(dict(children_below(
+                top, list_directories=True, same_device=True))), [top_file])
+            self.assertEqual(
+                list(children_in_directory(top, True, same_device=True)),
+                [top_file])
+            self.assertCountEqual(children_in_directory(top, True),
+                                  [top_file, bind_file, bind, file_bind])
+
+    @common.skipIfWindows
+    def test_children_in_directory_same_device(self):
+        """children_in_directory(same_device=True) skips other filesystems"""
+        top = self.mkdir('children-in-directory-device')
+        top_file = self.write_file(os.path.join(top, 'file'))
+        sub = self.mkdir(os.path.join(top, 'mounted'))
+        sub_file = self.write_file(os.path.join(sub, 'file'))
+
+        self.assertCountEqual(
+            children_in_directory(top, True, same_device=True),
+            [top_file, sub, sub_file])
+        other_dev = unittest.mock.Mock(st_dev=os.stat(top).st_dev + 1)
+        with unittest.mock.patch('os.stat', return_value=other_dev):
+            self.assertEqual(
+                list(children_in_directory(top, True, same_device=True)),
+                [top_file])
+
+    @common.skipIfWindows
+    def test_children_below_same_device(self):
+        """children_below(same_device=True) stays off other filesystems"""
+        top = self.mkdir('children-below-device')
+        top_file = self.write_file(os.path.join(top, 'file'))
+        sub = self.mkdir(os.path.join(top, 'mounted'))
+        sub_file = self.write_file(os.path.join(sub, 'file'))
+
+        self.assertCountEqual(dict(children_below(top, same_device=True)),
+                              [top_file, sub_file])
+        # Mounting needs root, so top reports another device than its subdirs
+        other_dev = unittest.mock.Mock(st_dev=os.stat(top).st_dev + 1)
+        with unittest.mock.patch('os.fstat', return_value=other_dev):
+            self.assertEqual(list(dict(children_below(top, same_device=True))),
+                             [top_file])
+            self.assertCountEqual(dict(children_below(top)),
+                                  [top_file, sub_file])
+
+    @common.skipIfWindows
+    def test_children_below_search_only(self):
+        """children_below() and delete() need only search permission above"""
+        if not hasattr(os, 'O_PATH'):
+            self.skipTest('O_PATH is not available')
+        if os.geteuid() == 0:
+            self.skipTest('root can read any directory')
+        top = self.mkdir('children-below-search-only')
+        middle = self.mkdir(os.path.join(top, 'middle'))
+        sub = self.mkdir(os.path.join(middle, 'dir', 'sub'))
+        path = self.write_file(os.path.join(sub, 'file'))
+        os.chmod(top, 0o100)
+        os.chmod(middle, 0o100)
+        try:
+            found = [p for p, _st in children_below(
+                os.path.dirname(sub), list_directories=True, top=top)]
+            self.assertEqual(found, [path, sub])
+            for p in found:
+                self.assertTrue(delete(p, shred=False, top=top))
+        finally:
+            os.chmod(middle, 0o700)
+            os.chmod(top, 0o700)
+        self.assertNotExists(sub)
+
+    @common.skipIfWindows
+    def test_children_below_log_root(self):
+        """children_below() logs a directory it cannot open"""
+        missing = os.path.join(self.tempdir, 'children-below-missing')
+        with self.assertLogs('bleachbit.FileUtilities', level='DEBUG') as cm:
+            self.assertEqual(list(children_below(missing)), [])
+        self.assertIn(missing, cm.output[0])
+
     @common.skipUnlessWindows
     def test_children_in_directory_windows_links(self):
         """Windows: ensure symlinked dirs and junctions are not followed"""
@@ -717,8 +901,8 @@ State=AAAA/wA...
         With shred disabled, the original file is never deleted, so a
         (simulated) symlink at its path must block the write and leave
         the original content in place. With shred enabled, the original
-        is deleted first as usual, and the guard must then block the
-        symlinked path from being recreated.
+        is deleted first as usual, and a symlink planted after that must
+        still block the path from being recreated.
         """
         content = '[Section]\nkey=value\n'
 
@@ -736,7 +920,7 @@ State=AAAA/wA...
         filename = self.write_file('clean_ini_target_shred', text=content)
         with unittest.mock.patch(
                 'bleachbit.FileUtilities.os.path.islink',
-                side_effect=lambda p: p == filename):
+                side_effect=lambda p: p == filename and not os.path.lexists(p)):
             with self.assertRaises(OSError):
                 clean_ini(filename, 'Section', None)
         self.assertNotExists(filename)
@@ -763,10 +947,33 @@ State=AAAA/wA...
         filename = self.write_file('clean_json_target_shred', text=content)
         with unittest.mock.patch(
                 'bleachbit.FileUtilities.os.path.islink',
-                side_effect=lambda p: p == filename):
+                side_effect=lambda p: p == filename and not os.path.lexists(p)):
             with self.assertRaises(OSError):
                 clean_json(filename, 'deleteme')
         self.assertNotExists(filename)
+
+    @common.skipIfWindows
+    def test_clean_ini_json_symlink_with_shred(self):
+        """A symlinked config is refused with shred as it is without"""
+        cases = (('ini', '[Section]\nkey=value\n',
+                  lambda path: clean_ini(path, 'Section', None)),
+                 ('json', '{"deleteme": 1, "keep": 2}',
+                  lambda path: clean_json(path, 'deleteme')))
+        for shred in (False, True):
+            options.set('shred', shred)
+            for ext, content, clean in cases:
+                with self.subTest(ext=ext, shred=shred):
+                    config_dir = self.mkdtemp()
+                    target = self.write_file(
+                        os.path.join(config_dir, 'target.' + ext),
+                        text=content)
+                    link = os.path.join(config_dir, 'link.' + ext)
+                    os.symlink(target, link)
+                    with self.assertRaises(OSError):
+                        clean(link)
+                    self.assertTrue(os.path.islink(link))
+                    with open(target, encoding='utf-8') as f:
+                        self.assertEqual(f.read(), content)
 
     @pytest.mark.no_xdist
     def test_delete(self):
@@ -791,6 +998,89 @@ State=AAAA/wA...
             with self.assertRaises(PermissionError):
                 delete(path, shred=False)
         self.assertExists(path)
+
+    @common.skipIfWindows
+    def test_delete_top_refuses_link(self):
+        """delete() with top does not go through a symlinked directory"""
+        top = self.mkdtemp()
+        outside = self.mkdtemp()
+        secret = self.write_file(os.path.join(outside, 'secret'), b'secret')
+        # Stands in for a directory swapped for a link after it was listed
+        os.symlink(outside, os.path.join(top, 'link'))
+        for shred in (False, True):
+            with self.subTest(shred=shred):
+                with self.assertRaises(OSError):
+                    delete(os.path.join(top, 'link', 'secret'),
+                           shred=shred, top=top)
+                with open(secret, 'rb') as f:
+                    self.assertEqual(f.read(), b'secret')
+
+                sub = self.mkdir(os.path.join(top, 'sub'))
+                inside = self.write_file(os.path.join(sub, 'inside'), b'abc')
+                self.assertTrue(delete(inside, shred=shred, top=top))
+                self.assertNotExists(inside)
+                self.assertTrue(delete(sub + os.sep, shred=shred, top=top))
+                self.assertNotExists(sub)
+
+    @common.skipIfWindows
+    def test_delete_top_error_filename(self):
+        """An error from delete() with top names the whole path"""
+        top = self.mkdir('delete-top-error')
+        path = self.write_file(os.path.join(top, 'file'))
+
+        for err_filename in (os.path.basename(path), None, 3):
+            with self.subTest(err_filename=err_filename):
+                err = PermissionError(
+                    errno.EACCES, 'Permission denied', err_filename)
+                with unittest.mock.patch('os.remove', side_effect=err):
+                    with self.assertRaises(PermissionError) as cm:
+                        delete(path, shred=False, top=top)
+                self.assertEqual(cm.exception.errno, errno.EACCES)
+                self.assertEqual(cm.exception.filename, path)
+        self.assertExists(path)
+
+        for bad_path in (os.path.join(self.tempdir, 'outside'), 'relative',
+                         os.sep):
+            with self.subTest(bad_path=bad_path):
+                with self.assertRaises(OSError) as cm:
+                    delete(bad_path, top=top)
+                self.assertEqual(cm.exception.errno, errno.EINVAL)
+                self.assertEqual(cm.exception.filename, bad_path)
+        self.assertEqual(list(children_below(self.tempdir, top=top)), [])
+
+    def test_delete_shred_overwrite_fails(self):
+        """delete() warns when shredding cannot overwrite the contents"""
+        path = self.write_file('test_delete_shred_overwrite_fails', b'secret')
+        e = PermissionError(errno.EPERM, 'Operation not permitted', path)
+        with unittest.mock.patch('bleachbit.FileUtilities.wipe_contents', side_effect=e):
+            with self.assertLogs('bleachbit.FileUtilities', level='WARNING') as cm:
+                self.assertTrue(delete(path, shred=True))
+        self.assertIn('Could not overwrite', cm.output[0])
+        # Without the \\?\ prefix on Windows
+        self.assertIn(f'of {path}:', cm.output[0])
+        self.assertNotExists(path)
+
+        # When os.remove() also fails (e.g. a locked file), do not emit a
+        # duplicate overwrite warning before raising the removal error.
+        path2 = self.write_file('test_delete_shred_both_fail', b'secret')
+        with unittest.mock.patch('bleachbit.FileUtilities.wipe_contents', side_effect=e), \
+                unittest.mock.patch('os.remove', side_effect=e), \
+                unittest.mock.patch('bleachbit.FileUtilities.logger.warning') as mock_warn:
+            with self.assertRaises(PermissionError):
+                delete(path2, shred=True)
+            mock_warn.assert_not_called()
+
+    def test_delete_shred_overwrite_fails_below_top(self):
+        """The overwrite warning names the whole path of a file under top"""
+        top = self.mkdtemp()
+        sub = self.mkdir(os.path.join(top, 'sub'))
+        path = self.write_file(os.path.join(sub, 'secret'), b'secret')
+        e = PermissionError(errno.EPERM, 'Operation not permitted', path)
+        with unittest.mock.patch('bleachbit.FileUtilities.wipe_contents', side_effect=e), \
+                self.assertLogs('bleachbit.FileUtilities', level='WARNING') as cm:
+            self.assertTrue(delete(path, shred=True, top=top))
+        self.assertIn(f'of {path}:', cm.output[0])
+        self.assertNotExists(path)
 
     def test_delete_windows_lstat_denied(self):
         """delete() on Windows still works where os.lstat() is denied
@@ -819,6 +1109,46 @@ State=AAAA/wA...
                 else:
                     mock_delete_file.assert_called_once()
                     mock_delete_path.assert_not_called()
+
+    def test_delete_windows_non_link_reparse_point(self):
+        """delete() treats only links and unopenable reparse points as links"""
+        cloud_tag = 0x9000601A
+        junction_tag = 0xA0000003
+        symlink_tag = 0xA000000C
+        af_unix_tag = 0x80000023
+        app_exec_link_tag = 0x8000001B
+        # (reparse tag, isdir, _delete_path func, or None for delete_file)
+        cases = ((0, True, os.rmdir),
+                 (cloud_tag, True, os.rmdir),
+                 (0, False, None),
+                 (cloud_tag, False, None),
+                 (junction_tag, True, os.remove),
+                 (symlink_tag, False, os.remove),
+                 (af_unix_tag, False, os.remove),
+                 (app_exec_link_tag, False, os.remove))
+        for tag, isdir, expected in cases:
+            with self.subTest(tag=hex(tag), isdir=isdir):
+                st = unittest.mock.Mock(
+                    st_reparse_tag=tag,
+                    st_file_attributes=stat.FILE_ATTRIBUTE_REPARSE_POINT)
+                mock_delete_file = unittest.mock.Mock()
+                mock_delete_path = unittest.mock.Mock()
+                with unittest.mock.patch.multiple(
+                        'bleachbit.FileUtilities', IS_POSIX=False,
+                        IS_WINDOWS=True, delete_file=mock_delete_file,
+                        _delete_path=mock_delete_path), \
+                        unittest.mock.patch('os.lstat', return_value=st), \
+                        unittest.mock.patch('os.path.lexists', return_value=True), \
+                        unittest.mock.patch('os.path.isdir', return_value=isdir), \
+                        unittest.mock.patch('os.path.isfile', return_value=not isdir):
+                    self.assertTrue(delete('C:\\placeholder', shred=not isdir))
+                if expected is None:
+                    mock_delete_file.assert_called_once()
+                    self.assertTrue(mock_delete_file.call_args.args[1])
+                    mock_delete_path.assert_not_called()
+                else:
+                    mock_delete_file.assert_not_called()
+                    self.assertIs(mock_delete_path.call_args.args[1], expected)
 
     def delete_helper(self, delete_func, shred):
         """Called by test_delete() with shred = False and = True"""
@@ -1004,9 +1334,8 @@ State=AAAA/wA...
                     self.assertTrue(delete_file(filename, shred))
                 else:
                     # Delete expected to fail.
-                    # pylint: disable=undefined-variable, possibly-used-before-assignment
                     # WindowsError is a builtin on Windows and imported above otherwise.
-                    # pylint: disable-next=possibly-used-before-assignment
+                    # pylint: disable-next=undefined-variable, possibly-used-before-assignment
                     with self.assertRaises(WindowsError):
                         delete_file(filename, shred)
                 win32file.CloseHandle(handle)
@@ -1074,12 +1403,51 @@ State=AAAA/wA...
 
         # Make sure shredding does not leave a renamed directory like
         # in https://github.com/bleachbit/bleachbit/issues/783
-        for allow_shred in (False, True):
-            self.assertFalse(delete(dirname, allow_shred=allow_shred))
-            self.assertExists(fn)
-            self.assertExists(dirname)
+        for top in (None, self.tempdir):
+            for allow_shred in (False, True):
+                with self.subTest(top=top, allow_shred=allow_shred):
+                    self.assertFalse(delete(
+                        dirname, shred=True, allow_shred=allow_shred, top=top))
+                    self.assertExists(fn)
+                    self.assertExists(dirname)
         os.remove(fn)
         self.assertTrue(is_dir_empty(dirname))
+
+    def test_delete_shred_dir_filled_after_check(self):
+        """A shredded directory that gains an entry keeps its name"""
+        dirname = self.mkdir('filled_dir')
+        fn = self.write_file(os.path.join(dirname, 'a_file'), b'content')
+        # As if the entry was created after the emptiness check
+        with unittest.mock.patch('bleachbit.FileUtilities.is_dir_empty',
+                                 return_value=True):
+            self.assertFalse(delete(dirname, shred=True))
+        self.assertExists(fn)
+
+    def test_delete_shred_dir_left_renamed(self):
+        """The error names where a shredded directory is left renamed"""
+        real_rename = os.rename
+
+        def rename(src, dst, **kwargs):
+            if os.path.basename(dst) == 'renamed_dir':
+                raise PermissionError(errno.EACCES, 'Permission denied', src)
+            return real_rename(src, dst, **kwargs)
+
+        for top in (None, self.tempdir):
+            with self.subTest(top=top):
+                dirname = self.mkdir('renamed_dir')
+                self.write_file(os.path.join(dirname, 'a_file'), b'content')
+                with unittest.mock.patch(
+                        'bleachbit.FileUtilities.is_dir_empty',
+                        return_value=True), \
+                        unittest.mock.patch('os.rename', side_effect=rename):
+                    with self.assertRaises(OSError) as cm:
+                        delete(dirname, shred=True, top=top)
+                left = cm.exception.filename
+                self.assertEqual(cm.exception.filename2, dirname)
+                self.assertEqual(os.path.dirname(left), self.tempdir)
+                self.assertNotEqual(os.path.basename(left), 'renamed_dir')
+                self.assertExists(os.path.join(left, 'a_file'))
+                self.assertNotExists(dirname)
 
     def test_delete_read_only_file(self):
         """Unit test for delete() with read-only file"""
@@ -1136,6 +1504,18 @@ State=AAAA/wA...
                 self.assertDirectoryCount(tmp_dir, 2)
                 self.assertTrue(is_hard_link(link))
                 self.assertTrue(is_hard_link(target))
+                if IS_POSIX:
+                    symlink = os.path.join(tmp_dir, f'symlink-{shred}')
+                    os.symlink(link, symlink)
+                    dir_fd = os.open(tmp_dir, os.O_RDONLY | os.O_DIRECTORY)
+                    try:
+                        self.assertTrue(
+                            is_hard_link(os.path.basename(link), dir_fd))
+                        self.assertFalse(
+                            is_hard_link(os.path.basename(symlink), dir_fd))
+                    finally:
+                        os.close(dir_fd)
+                    os.unlink(symlink)
 
                 self.assertTrue(delete(link, shred=shred))
                 self.assertNotExists(link)
@@ -1366,21 +1746,6 @@ State=AAAA/wA...
                 'charset_normalizer module is not available', cm.output[0])
             os.unlink(temp.name)
 
-    @common.skipIfWindows
-    def test_ego_owner(self):
-        """Unit test for ego_owner()"""
-        # pylint: disable=no-member
-        self.assertEqual(ego_owner('/bin/ls'), os.getuid() == 0)
-
-        own_fn = self.mkstemp()
-        self.assertTrue(ego_owner(own_fn))
-
-        # A path that vanished must not raise
-        os.unlink(own_fn)
-        self.assertFalse(ego_owner(own_fn))
-        self.assertFalse(
-            ego_owner(os.path.join(self.tempdir, 'does_not_exist')))
-
     def test_execute_sqlite3(self):
         """Unit test for execute_sqlite3()"""
         db_path = self.mkstemp(suffix='.sqlite')
@@ -1402,6 +1767,43 @@ State=AAAA/wA...
         gc_collect()
         os.unlink(db_path)
         self.assertNotExists(db_path)
+
+    def test_execute_sqlite3_semicolon_in_literal(self):
+        """execute_sqlite3() keeps a ';' inside a literal, such as a path"""
+        db_path = self.mkstemp(suffix='.sqlite')
+        attach_path = os.path.join(self.mkdtemp(), 'a;b.sqlite')
+
+        execute_sqlite3(
+            db_path,
+            "CREATE TABLE test (name TEXT);"
+            "INSERT INTO test (name) VALUES ('x;y');"
+            f"ATTACH DATABASE '{attach_path}' AS other;"
+            "CREATE TABLE other.test (name TEXT)")
+
+        with contextlib.closing(sqlite3.connect(db_path)) as conn:
+            rows = conn.execute('SELECT name FROM test').fetchall()
+        self.assertEqual(rows, [('x;y',)])
+        self.assertExists(attach_path)
+
+        with self.assertRaises(sqlite3.OperationalError):
+            execute_sqlite3(db_path, "INSERT INTO test (name) VALUES ('x")
+
+    def test_execute_sqlite3_locked(self):
+        """execute_sqlite3() fails fast on a locked database"""
+        db_path = os.path.join(self.mkdtemp(), 'locked.sqlite')
+        execute_sqlite3(db_path, 'CREATE TABLE test (id int)')
+        holder = sqlite3.connect(db_path, isolation_level=None)
+        try:
+            holder.execute('PRAGMA locking_mode=EXCLUSIVE')
+            holder.execute('BEGIN EXCLUSIVE')
+            for cmd in ('DELETE FROM test', 'vacuum'):
+                start = time.monotonic()
+                with self.assertRaisesRegex(sqlite3.OperationalError,
+                                            'database is locked'):
+                    execute_sqlite3(db_path, cmd)
+                self.assertLess(time.monotonic() - start, 3)
+        finally:
+            holder.close()
 
     def test_execute_sqlite3_open_error_translation(self):
         """Unit test for execute_sqlite3() open-error translation
@@ -1533,6 +1935,15 @@ State=AAAA/wA...
             self.assertEqual(extended_path_undo(extended), short)
             # unextended paths shouldn't be shortened any more
             self.assertEqual(extended_path_undo(short), short)
+
+    @common.skipUnlessWindows
+    def test_extended_path_undo_unc_case(self):
+        """Extended UNC prefixes are case insensitive."""
+        path = r'\\server\share\folder\file.txt'
+        for prefix in ('unc', 'UNC', 'Unc'):
+            with self.subTest(prefix=prefix):
+                self.assertEqual(
+                    path, extended_path_undo(fr'\\?\{prefix}\{path[2:]}'))
 
     def test_free_space(self):
         """Unit test for free_space()"""
@@ -1887,13 +2298,28 @@ State=AAAA/wA...
         fake_file = unittest.mock.Mock(path='/tmp/opened')
         proc = unittest.mock.Mock()
         proc.open_files.return_value = [fake_file]
+        proc.memory_maps.return_value = []
         denied = unittest.mock.Mock()
         denied.open_files.side_effect = OSError('denied')
         empty = unittest.mock.Mock(path='')
         proc_empty = unittest.mock.Mock()
         proc_empty.open_files.return_value = [empty]
+        proc_empty.memory_maps.return_value = []
         with unittest.mock.patch('psutil.process_iter', return_value=[proc, denied, proc_empty]):
             self.assertEqual(list(open_files_psutil()), ['/tmp/opened'])
+
+    def test_open_files_psutil_mapped(self):
+        """open_files_psutil() yields a file that is mapped but not open"""
+        proc = unittest.mock.Mock()
+        proc.open_files.return_value = []
+        proc.memory_maps.return_value = [
+            unittest.mock.Mock(path='/tmp/mapped'),
+            unittest.mock.Mock(path='[anon]')]
+        no_maps = unittest.mock.Mock()
+        no_maps.open_files.return_value = []
+        no_maps.memory_maps.side_effect = psutil.AccessDenied()
+        with unittest.mock.patch('psutil.process_iter', return_value=[proc, no_maps]):
+            self.assertEqual(list(open_files_psutil()), ['/tmp/mapped'])
 
     def test_open_files_freebsd_without_psutil(self):
         """open_files_freebsd() falls back to lsof when psutil is missing"""
@@ -1929,19 +2355,95 @@ State=AAAA/wA...
         openfiles.scan()
         self.assertFalse(openfiles.is_open(filename))
 
+    def test_open_files_linux_maps_unescape(self):
+        """open_files_linux() decodes octal escapes in /proc/*/maps"""
+        maps_data = (
+            b'7f0000-7f1000 r--s 00000000 08:01 123 /tmp/a\\040b\\012c\n'
+            b'7f1000-7f2000 rw-p 00000000 00:00 0 [heap]\n'
+        )
+        with unittest.mock.patch(
+                'bleachbit.FileUtilities.glob.iglob',
+                side_effect=[iter(['/proc/1/fd/3']), iter(['/proc/1/maps'])]), \
+                unittest.mock.patch(
+                    'bleachbit.FileUtilities.open', create=True,
+                    new=unittest.mock.mock_open(read_data=maps_data)):
+            self.assertEqual(list(open_files_linux()),
+                             ['/proc/1/fd/3', '/tmp/a b\nc'])
+
+    @common.skipUnlessLinux
+    def test_open_files_mapped(self):
+        """OpenFiles counts a file that is mapped but no longer open"""
+        if sys.version_info < (3, 13):
+            self.skipTest('mmap needs trackfd=False to not keep a descriptor')
+        # The kernel escapes a newline in /proc/*/maps as \012
+        filename = self.write_file(
+            'bleachbit-test-open-files-mapped a\nb', b'x' * 4096)
+        with open(filename, 'rb') as f:
+            mapped = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ,
+                               trackfd=False)
+        try:
+            self.assertTrue(OpenFiles().is_open(filename))
+        finally:
+            mapped.close()
+        self.assertFalse(OpenFiles().is_open(filename))
+
     def test_same_partition(self):
         """Unit test for same_partition()"""
         home = os.path.expanduser('~')
         self.assertTrue(same_partition(home, home))
         if IS_POSIX:
             self.assertFalse(same_partition(home, '/dev'))
+            if os.path.isdir('/proc') and os.path.isdir('/sys'):
+                self.assertFalse(same_partition('/proc', '/sys'))
         elif IS_WINDOWS:
             home_drive = os.path.splitdrive(home)[0]
             from bleachbit.Windows import get_fixed_drives
             for drive in get_fixed_drives():
                 this_drive = os.path.splitdrive(drive)[0]
+                self.assertTrue(same_partition(drive, drive))
                 self.assertEqual(same_partition(home, drive),
                                  home_drive == this_drive)
+
+    def test_same_partition_device(self):
+        """same_partition() compares devices, not only sizes or free space"""
+        devices = {'/a': 1, '/b': 2, '/c': 3, '/d': 4, '/proc': 5, '/sys': 6}
+        blocks = {'/a': (1000, 500), '/b': (1000, 400), '/c': (1000, 500),
+                  '/d': (1000, 499), '/proc': (0, 0), '/sys': (0, 0)}
+
+        def fake_stat(path):
+            return unittest.mock.Mock(st_dev=devices[path])
+
+        def fake_statvfs(path):
+            f_blocks, f_bfree = blocks[path]
+            return unittest.mock.Mock(f_blocks=f_blocks, f_bfree=f_bfree)
+
+        with unittest.mock.patch('bleachbit.FileUtilities.IS_WINDOWS', False), \
+                unittest.mock.patch('os.stat', side_effect=fake_stat), \
+                unittest.mock.patch('os.statvfs', side_effect=fake_statvfs, create=True):
+            self.assertTrue(same_partition('/a', '/a'))
+            # different file systems of the same size
+            self.assertFalse(same_partition('/a', '/b'))
+            # btrfs subvolumes of one file system
+            self.assertTrue(same_partition('/a', '/c'))
+            # and one whose free space changed between the calls
+            self.assertTrue(same_partition('/a', '/d'))
+            # pseudo-filesystems with f_blocks == 0
+            self.assertTrue(same_partition('/proc', '/proc'))
+            self.assertFalse(same_partition('/proc', '/sys'))
+
+        # Free space on C: changes between the two lookups
+        changing_free_space = unittest.mock.Mock(side_effect=[1000, 996])
+        with unittest.mock.patch('bleachbit.FileUtilities.IS_WINDOWS', True), \
+                unittest.mock.patch('bleachbit.FileUtilities.free_space', changing_free_space), \
+                unittest.mock.patch('os.stat', return_value=unittest.mock.Mock(st_dev=7)):
+            self.assertTrue(same_partition('C:\\Temp', 'C:\\'))
+
+        # Volumes with st_dev == 0 (such as zero-serial RAM disks) fall back
+        # to comparing drive roots instead of colliding at 0 == 0.
+        with unittest.mock.patch('bleachbit.FileUtilities.IS_WINDOWS', True), \
+                unittest.mock.patch('os.stat', return_value=unittest.mock.Mock(st_dev=0)):
+            self.assertTrue(same_partition('Z:\\Temp', 'z:\\'))
+            self.assertFalse(same_partition('Y:\\Temp', 'Z:\\'))
 
     def test_uris_to_paths(self):
         """Unit test for uris_to_paths()"""
@@ -1969,6 +2471,15 @@ State=AAAA/wA...
         self.assertEqual(uris_to_paths(['file:']), [])
         self.assertEqual(uris_to_paths(['file://']), [])
         self.assertEqual(uris_to_paths(['file:///']), [os.path.normpath('/')])
+
+    @common.skipIfWindows
+    def test_uris_to_paths_undecodable(self):
+        """A file URI for a name that is not valid UTF-8 gives the name on disk"""
+        path = os.path.join(os.fsencode(self.tempdir), b'caf\xe9.txt')
+        uri = 'file://' + urllib.parse.quote(path)
+        # url2pathname() before Python 3.14
+        with unittest.mock.patch('urllib.request.url2pathname', urllib.parse.unquote):
+            self.assertEqual(uris_to_paths([uri]), [os.fsdecode(path)])
 
     def test_vacuum_sqlite3(self):
         """Unit test for method vacuum_sqlite3()"""
@@ -2086,6 +2597,184 @@ State=AAAA/wA...
             self.assertFalse(whitelisted(path),
                              f"{path} should not be protected")
 
+    @common.skipIfWindows
+    def test_whitelisted_posix_root_folder(self):
+        """Keeping the filesystem root also keeps its descendants."""
+        path = self.write_file('root_keep_test')
+        link = os.path.join(self.tempdir, 'root_keep_link')
+        os.symlink(path, link)
+        for root in ('/', '/./', '///'):
+            with self.subTest(root=root):
+                options.set_whitelist_paths([('folder', root)])
+                self.assertTrue(whitelisted(self.tempdir))
+                self.assertTrue(whitelisted(path))
+                self.assertTrue(whitelisted(link))
+                self.assertFalse(whitelisted('relative/path'))
+        options.set_whitelist_paths([('file', '/')])
+        self.assertFalse(whitelisted(path))
+
+    @common.skipIfWindows
+    def test_whitelisted_posix_spelling_cache(self):
+        """Normalize keep entries once, and refresh after edits or a new run."""
+        clear_path_spellings()
+        self.addCleanup(clear_path_spellings)
+        keep = '/home/keep//folder/'
+        options.set_whitelist_paths([('folder', keep)])
+        with unittest.mock.patch(
+                'bleachbit.FileUtilities._posix_keep_list_spelling',
+                wraps=_posix_keep_list_spelling) as spelling:
+            for _ in range(3):
+                self.assertTrue(whitelisted('/home/keep/folder/child'))
+            self.assertEqual(
+                1, spelling.call_args_list.count(unittest.mock.call(keep)))
+            options.set_whitelist_paths([('file', keep)])
+            self.assertFalse(whitelisted('/home/keep/folder/child'))
+            self.assertEqual(
+                2, spelling.call_args_list.count(unittest.mock.call(keep)))
+            options.set_whitelist_paths([('folder', '')])
+            self.assertTrue(whitelisted('/home/elsewhere'))
+            self.assertFalse(whitelisted('relative/path'))
+            options.set_whitelist_paths([])
+            self.assertFalse(whitelisted('/home/keep/folder'))
+            options.set_whitelist_paths([('folder', '/home/other/')])
+            self.assertFalse(whitelisted('/home/keep/folder/child'))
+            self.assertTrue(whitelisted('/home/other/child'))
+            clear_path_spellings()
+            self.assertTrue(whitelisted('/home/other/child'))
+            self.assertEqual(
+                2, spelling.call_args_list.count(unittest.mock.call('/home/other/')))
+
+    @common.skipIfWindows
+    def test_whitelisted_posix_symlink_retarget(self):
+        """Cached keep spellings must not freeze symlink targets."""
+        first = self.write_file('first')
+        second = self.write_file('second')
+        kept_link = os.path.join(self.tempdir, 'kept_link')
+        other_link = os.path.join(self.tempdir, 'other_link')
+        os.symlink(first, kept_link)
+        os.symlink(first, other_link)
+        options.set_whitelist_paths([('file', kept_link)])
+        self.assertTrue(whitelisted(other_link))
+        os.unlink(kept_link)
+        os.symlink(second, kept_link)
+        self.assertFalse(whitelisted(other_link))
+        self.assertTrue(whitelisted(kept_link))
+
+    @unittest.skipUnless(IS_MAC, 'Requires native macOS Unicode path handling')
+    def test_whitelisted_macos_decomposed_symlink(self):
+        """Normalize resolved file and folder keeps, including descendants."""
+        self.addCleanup(clear_path_spellings)
+        root = self.mkdtemp()
+        for kind in ('file', 'folder'):
+            target = os.path.join(root, unicodedata.normalize(
+                'NFD', kind + '-r\u00e9sum\u00e9'))
+            if kind == 'folder':
+                self.mkdir(target)
+                child = self.write_file(os.path.join(
+                    target, unicodedata.normalize('NFD', 'caf\u00e9')))
+            else:
+                self.write_file(target)
+                child = target
+            kept = os.path.join(root, unicodedata.normalize(
+                'NFD', kind + '-gard\u00e9'))
+            candidate = os.path.join(root, kind + '-candidate')
+            descendant = os.path.join(root, kind + '-descendant')
+            outside = os.path.join(root, kind + '-outside')
+            os.symlink(target, kept)
+            os.symlink(target, candidate)
+            os.symlink(child, descendant)
+            os.symlink(self.write_file(target + '2'), outside)
+            self.assertTrue(os.path.samefile(
+                target, unicodedata.normalize('NFC', target)))
+            self.assertNotEqual(os.path.realpath(kept), unicodedata.normalize(
+                'NFC', os.path.realpath(kept)))
+            for keep_path in (target, kept):
+                for form in ('NFD', 'NFC'):
+                    with self.subTest(kind=kind, keep=keep_path, form=form):
+                        options.set_whitelist_paths([
+                            (kind, unicodedata.normalize(form, keep_path))])
+                        for path in (keep_path, candidate, descendant):
+                            with self.subTest(path=path):
+                                self.assertTrue(whitelisted(path), path)
+                        self.assertFalse(whitelisted(root))
+                        self.assertFalse(whitelisted(target + '2'))
+                        self.assertFalse(whitelisted(outside))
+
+    @unittest.skipUnless(IS_MAC, 'Requires native macOS Unicode path handling')
+    def test_whitelisted_macos_decomposed_symlink_retarget(self):
+        """Neither keep-link nor candidate-link targets are cached in a run."""
+        self.addCleanup(clear_path_spellings)
+        root = self.mkdtemp()
+        for kind in ('file', 'folder'):
+            with self.subTest(kind=kind):
+                targets = []
+                candidates = []
+                for index in range(2):
+                    target = os.path.join(root, unicodedata.normalize(
+                        'NFD', f'{kind}-{index}-r\u00e9sum\u00e9'))
+                    if kind == 'folder':
+                        self.mkdir(target)
+                        child = self.write_file(os.path.join(
+                            target, unicodedata.normalize('NFD', 'caf\u00e9')))
+                    else:
+                        self.write_file(target)
+                        child = target
+                    candidate = os.path.join(root, f'{kind}-candidate-{index}')
+                    os.symlink(child, candidate)
+                    targets.append(target)
+                    candidates.append(candidate)
+                kept = os.path.join(root, kind + '-kept')
+                os.symlink(targets[0], kept)
+                options.set_whitelist_paths([(kind, kept)])
+                self.assertTrue(whitelisted(candidates[0]))
+                self.assertFalse(whitelisted(candidates[1]))
+                os.unlink(kept)
+                os.symlink(targets[1], kept)
+                self.assertFalse(whitelisted(candidates[0]))
+                self.assertTrue(whitelisted(candidates[1]))
+                os.unlink(candidates[0])
+                os.symlink(os.readlink(candidates[1]), candidates[0])
+                self.assertTrue(whitelisted(candidates[0]))
+                os.unlink(candidates[1])
+                os.symlink(targets[0], candidates[1])
+                self.assertFalse(whitelisted(candidates[1]))
+
+    @unittest.skipUnless(IS_MAC, 'Requires native macOS Unicode path handling')
+    def test_whitelisted_macos_decomposed_spelling_cache(self):
+        """Cached NFD keep spellings match both native NFD and NFC paths."""
+        clear_path_spellings()
+        self.addCleanup(clear_path_spellings)
+        keep = self.mkdir(unicodedata.normalize('NFD', 'gard\u00e9'))
+        child = self.write_file(os.path.join(keep, 'child'))
+        options.set_whitelist_paths([('folder', keep)])
+        with unittest.mock.patch(
+                'bleachbit.FileUtilities._posix_keep_list_spelling',
+                wraps=_posix_keep_list_spelling) as spelling:
+            for _ in range(3):
+                for form in ('NFD', 'NFC'):
+                    self.assertTrue(whitelisted(
+                        unicodedata.normalize(form, child)))
+            self.assertEqual(
+                1, spelling.call_args_list.count(unittest.mock.call(keep)))
+            options.set_whitelist_paths([('file', keep)])
+            self.assertFalse(whitelisted(child))
+            self.assertEqual(
+                2, spelling.call_args_list.count(unittest.mock.call(keep)))
+            clear_path_spellings()
+            self.assertTrue(whitelisted(unicodedata.normalize('NFC', keep)))
+            self.assertEqual(
+                3, spelling.call_args_list.count(unittest.mock.call(keep)))
+
+    @common.skipIfWindows
+    def test_whitelisted_posix_normpath(self):
+        """Keep list matches paths spelled with '//' or a trailing '/'"""
+        options.set_whitelist_paths(
+            [('file', '/home/foo/cookies.sqlite'), ('folder', '/home/folder/')])
+        self.assert_is_whitelisted('/home/foo//cookies.sqlite')
+        self.assert_is_whitelisted('/home/folder')
+        self.assert_is_whitelisted('/home//folder/model.bin')
+        self.assertFalse(whitelisted('/home//folder2/model.bin'))
+
     @common.skipUnlessWindows
     def test_whitelisted_windows(self):
         """Test whitelisted() on Windows"""
@@ -2142,6 +2831,144 @@ State=AAAA/wA...
                 self.assertFalse(whitelisted(temp_root + r'\bleachbit.tmp'))
                 self.assertFalse(whitelisted(temp_root + r'\subdir'))
 
+    @common.skipUnlessWindows
+    def test_whitelisted_windows_aliases(self):
+        """Keep list matches the Sysnative and 8.3 spellings of a kept path"""
+        windir = os.path.expandvars('%windir%')
+        options.set_whitelist_paths(
+            [('folder', os.path.join(windir, 'System32', 'LogFiles'))])
+        self.assert_is_whitelisted(
+            os.path.join(windir, 'Sysnative', 'LogFiles', 'foo.log'))
+        self.assertFalse(whitelisted(
+            os.path.join(windir, 'SysWOW64', 'LogFiles', 'foo.log')))
+
+        # pylint: disable=c-extension-no-member
+        long_dir = win32api.GetLongPathName(
+            self.mkdir(os.path.join(self.mkdtemp(), 'long directory name')))
+        short_dir = win32api.GetShortPathName(long_dir)
+        if short_dir == long_dir:
+            self.skipTest('8.3 names are disabled on this volume')
+        short_file = self.write_file(os.path.join(short_dir, 'foo.log'))
+        options.set_whitelist_paths([('folder', long_dir)])
+        self.assert_is_whitelisted(short_dir)
+        self.assert_is_whitelisted(short_file)
+        self.assert_is_whitelisted(extended_path(short_file))
+
+    @common.skipUnlessWindows
+    def test_whitelisted_windows_extended_paths(self):
+        """Extended and ordinary paths honor the same keep entries."""
+        folder = self.mkdir('extended keep folder')
+        kept_file = self.write_file(os.path.join(folder, 'kept.txt'))
+        other_file = self.write_file('not kept.txt')
+        for kind, keep_path, candidate in (
+                ('file', kept_file, kept_file),
+                ('folder', folder, kept_file),
+                ('folder', os.path.splitdrive(folder)[0] + os.sep, kept_file),
+                ('file', r'\\server\share\kept.txt', r'\\server\share\kept.txt'),
+                ('folder', r'\\server\share\kept', r'\\server\share\kept\file.txt')):
+            spellings = [candidate, extended_path(candidate)]
+            keep_spellings = [keep_path, extended_path(keep_path)]
+            if candidate.startswith('\\\\'):
+                spellings.append(extended_path(candidate).replace(
+                    '\\unc\\', '\\UNC\\', 1))
+                keep_spellings.append(extended_path(keep_path).replace(
+                    '\\unc\\', '\\UNC\\', 1))
+            for entry, path in itertools.product(keep_spellings, spellings):
+                with self.subTest(kind=kind, entry=entry, path=path):
+                    options.set_whitelist_paths([(kind, entry)])
+                    self.assert_is_whitelisted(path)
+                    if kind == 'file':
+                        self.assertFalse(whitelisted(
+                            extended_path(other_file)))
+                    elif keep_path == folder:
+                        self.assertFalse(whitelisted(
+                            extended_path(folder + '2\\file.txt')))
+
+    @common.skipUnlessWindows
+    def test_whitelisted_windows_directory_cache_case(self):
+        """Case variants share the native long-directory lookup."""
+        # pylint: disable=c-extension-no-member
+        long_dir = win32api.GetLongPathName(
+            self.mkdir('long directory cache name'))
+        short_dir = win32api.GetShortPathName(long_dir)
+        if short_dir == long_dir:
+            self.skipTest('8.3 names are disabled on this volume')
+        short_file = self.write_file(os.path.join(short_dir, 'kept.txt'))
+        options.set_whitelist_paths([('folder', long_dir)])
+        with unittest.mock.patch.dict(
+                'bleachbit.FileUtilities._long_dir_names', clear=True), \
+                unittest.mock.patch(
+                    'bleachbit.FileUtilities.win32file.GetLongPathName',
+                    wraps=win32file.GetLongPathName) as native_long:
+            self.assert_is_whitelisted(short_file)
+            self.assertEqual(1, native_long.call_count)
+
+    @common.skipUnlessWindows
+    def test_whitelisted_windows_unsettled_entry_appears(self):
+        """A missing 8.3 entry is retried when its directory reappears."""
+        # pylint: disable=c-extension-no-member
+        long_dir = win32api.GetLongPathName(
+            self.mkdir('future keep directory'))
+        short_dir = win32api.GetShortPathName(long_dir)
+        if short_dir == long_dir:
+            self.skipTest('8.3 names are disabled on this volume')
+        os.rmdir(long_dir)
+        clear_path_spellings()
+        self.addCleanup(clear_path_spellings)
+        options.set_whitelist_paths([('folder', short_dir)])
+        candidate = os.path.join(long_dir, 'kept.txt')
+        self.assertFalse(whitelisted(candidate))
+        os.mkdir(long_dir)
+        self.assertEqual(short_dir, win32api.GetShortPathName(long_dir))
+        self.write_file(candidate)
+        self.assert_is_whitelisted(candidate)
+
+    @common.skipUnlessWindows
+    def test_whitelisted_windows_spelling_cache(self):
+        """Windows is asked for a long name once per directory and entry"""
+        temp = r'C:\Users\JOHNSM~1\AppData\Local\Temp'
+        keep_file = r'C:\Users\JOHNSM~1\Desktop\NEWFOL~1\keep.txt'
+        created = []
+
+        def long_name(path):
+            if 'newfol~1' in path.lower() and not created:
+                # pylint: disable-next=c-extension-no-member,possibly-used-before-assignment
+                raise pywintypes.error(2, 'GetLongPathName', 'not found')
+            return path.replace('JOHNSM~1', 'John Smith').replace(
+                'NEWFOL~1', 'New folder')
+
+        caches = (
+            unittest.mock.patch.dict(
+                'bleachbit.FileUtilities._long_dir_names', clear=True),
+            unittest.mock.patch.dict(
+                'bleachbit.FileUtilities._keep_list_cache',
+                {'entries': (), 'spellings': {}}, clear=True))
+        for cache in caches:
+            cache.start()
+            self.addCleanup(cache.stop)
+        options.set_whitelist_paths(
+            [('folder', temp + r'\keep'), ('file', keep_file)])
+        with unittest.mock.patch(
+                'bleachbit.FileUtilities.win32file.GetLongPathName',
+                side_effect=long_name) as mock_long:
+            for i in range(50):
+                self.assertTrue(whitelisted(fr'{temp}\keep\file{i}.txt'))
+                self.assertFalse(whitelisted(fr'{temp}\other\file{i}.txt'))
+            temp_calls = [call.args[0] for call in mock_long.call_args_list
+                          if 'appdata' in call.args[0].lower()]
+            self.assertEqual(3, len(temp_calls), temp_calls)
+            # the entry for a folder not created yet is spelled again later
+            long_keep_file = r'C:\Users\John Smith\Desktop\New folder\keep.txt'
+            self.assertFalse(whitelisted(long_keep_file))
+            created.append(True)
+            self.assertTrue(whitelisted(long_keep_file))
+            # the next run asks again, for the entry and the directory
+            clear_path_spellings()
+            self.assertTrue(whitelisted(fr'{temp}\keep\file0.txt'))
+            temp_calls = [call.args[0] for call in mock_long.call_args_list
+                          if 'appdata' in call.args[0].lower()]
+            self.assertEqual(5, len(temp_calls), temp_calls)
+
     @common.skipIfWindows
     def test_whitelisted_posix_symlink(self):
         """Symlink test for whitelisted_posix()"""
@@ -2185,7 +3012,10 @@ State=AAAA/wA...
 
         It is called frequently, so the speed is important."""
         d = '/usr/bin'
-        keep_list = [('file', '/home/foo'), ('folder', '/home/folder')]
+        # Not under /home: macOS automounts it, which makes realpath() of
+        # the keep list slow
+        keep_list = [('file', os.path.join(self.tempdir, 'foo')),
+                     ('folder', os.path.join(self.tempdir, 'folder'))]
         if IS_WINDOWS:
             d = os.path.expandvars(r'%windir%\system32')
             keep_list = [('file', r'c:\filename'), ('folder', r'c:\\folder')]

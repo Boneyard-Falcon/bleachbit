@@ -1,21 +1,8 @@
-# vim: ts=4:sw=4:expandtab
-
-# BleachBit
-# Copyright (C) 2008-2025 Andrew Ziem
-# https://www.bleachbit.org
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (c) 2008-2026 Andrew Ziem.
 #
-# This program is free software: you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
-#
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License
-# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+# This work is licensed under the terms of the GNU GPL, version 3 or
+# later.  See the COPYING file in the top-level directory.
 
 
 """
@@ -48,7 +35,7 @@ logger = logging.getLogger(__name__)
 
 Deletion stays allowed, so blocking registry deletion too would buy nothing.
 """
-UNTRUSTED_BLOCKED_COMMANDS = ('process',)
+UNTRUSTED_BLOCKED_COMMANDS = ('process', 'process.terminate')
 
 
 class _ETSimpleTextNode:
@@ -96,6 +83,9 @@ class _ETActionElementAdapter:
 
     def getAttribute(self, name):
         return self._element.attrib.get(name, '')
+
+    def hasAttribute(self, name):
+        return name in self._element.attrib
 
 
 def _gettext_etree(element):
@@ -320,7 +310,8 @@ class CleanerML:
         """<warning> element under <option>"""
         msgid = _gettext_etree(warning)
         self.option_warning = _(msgid)
-        self.xlate_cb(msgid)
+        translators = warning.attrib.get('translators', '')
+        self.xlate_cb(msgid, translators)
 
     def handle_cleaner_option_action(self, action_node):
         """<action> element under <option>"""
@@ -371,7 +362,9 @@ class CleanerML:
             value_str = _gettext_etree(value_element)
             search_type = value_element.attrib.get('search', '')
             if search_type == 'glob':
-                value_list = expand_glob_join(value_str, '')
+                # Drop the trailing separator, or '$$var$$/x' becomes 'dir//x'
+                value_list = [os.path.normpath(value)
+                              for value in expand_glob_join(value_str, '')]
             elif search_type == 'winreg':
                 if not IS_WINDOWS:
                     continue
@@ -413,19 +406,26 @@ def reject_world_writable(pathname):
 
 
 def list_cleanerml_files(local_only=False, system_only=False):
-    """List CleanerML files"""
+    """List CleanerML files
+
+    The directories come in order of precedence (local, system, personal)
+    and the files are sorted within each one.
+    """
     cleanerdirs = ()
-    if not system_only:
-        cleanerdirs += (bleachbit.personal_cleaners_dir, )
-        if bleachbit.local_cleaners_dir:
-            # If the application is installed, locale_cleaners_dir is None.
-            # If portable mode, local_cleaners_dir is under the directory of
-            # `bleachbit.py`.
-            cleanerdirs += (bleachbit.local_cleaners_dir, )
+    if not system_only and bleachbit.local_cleaners_dir:
+        # If the application is installed, locale_cleaners_dir is None.
+        # If portable mode, local_cleaners_dir is under the directory of
+        # `bleachbit.py`.
+        cleanerdirs += (bleachbit.local_cleaners_dir, )
     if not local_only and bleachbit.system_cleaners_dir:
         cleanerdirs += (bleachbit.system_cleaners_dir, )
+    # In portable mode on Windows, the personal directory is the local one.
+    if not system_only and bleachbit.personal_cleaners_dir not in cleanerdirs:
+        cleanerdirs += (bleachbit.personal_cleaners_dir, )
     check_world_writable = not IS_WINDOWS
-    for pathname in listdir(cleanerdirs):
+    pathnames = (pathname for cleanerdir in cleanerdirs
+                 for pathname in sorted(listdir(cleanerdir)))
+    for pathname in pathnames:
         if not pathname.lower().endswith('.xml'):
             continue
         if check_world_writable:
@@ -460,9 +460,16 @@ def is_trusted_cleaner(pathname):
 
 
 def load_cleaners(cb_progress=lambda x: None, allow_local=True):
-    """Scan for CleanerML and load them"""
+    """Scan for CleanerML and load them
+
+    When two files share a cleaner id, the first one listed wins, so a
+    personal cleaner cannot replace a bundled one.
+    """
+    if IS_POSIX:
+        from bleachbit import Unix
+        # handle_localizations() adds to this tree on every load
+        Unix.locales = Unix.Locales()
     cleanerml_files = list(list_cleanerml_files(system_only=not allow_local))
-    cleanerml_files.sort()
     if not cleanerml_files:
         logger.debug('No CleanerML files to load.')
         return
@@ -470,6 +477,7 @@ def load_cleaners(cb_progress=lambda x: None, allow_local=True):
     cb_progress(0.0)
     files_done = 0
     not_usable = []
+    loaded = {}
     for pathname in cleanerml_files:
         try:
             xmlcleaner = CleanerML(
@@ -483,8 +491,12 @@ def load_cleaners(cb_progress=lambda x: None, allow_local=True):
             yield True
             continue
         cleaner = xmlcleaner.get_cleaner()
-        if cleaner.is_usable():
+        if cleaner.id in loaded:
+            logger.warning('Ignoring cleaner %s because %s has the same id',
+                           pathname, loaded[cleaner.id])
+        elif cleaner.is_usable():
             Cleaner.backends[cleaner.id] = cleaner
+            loaded[cleaner.id] = pathname
         else:
             if cleaner.id:
                 not_usable.append(cleaner.id)

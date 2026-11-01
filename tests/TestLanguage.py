@@ -64,6 +64,18 @@ class LanguageTestCase(common.BleachbitTestCase):
             self.skipTest('missing translations')
         self.assertIn('es', slangs)
 
+    def test_get_supported_language_codes_damaged_catalog(self):
+        """A damaged catalog of one language is skipped, not raised"""
+        locale_dir = self.mkdtemp()
+        for lang, content in (('de', b''), ('fr', b'not a catalog')):
+            messages_dir = self.mkdir(
+                os.path.join(locale_dir, lang, 'LC_MESSAGES'))
+            self.write_file(
+                os.path.join(messages_dir, 'bleachbit.mo'), content)
+        with mock.patch('bleachbit.locale_dir', locale_dir), \
+                self.assertLogs('bleachbit.Language', level='WARNING'):
+            self.assertEqual(['en', 'en_US'], get_supported_language_codes())
+
     def test_find_supported_language_code(self):
         """Test find_supported_language_code()
 
@@ -405,11 +417,34 @@ class SetupTranslationEnvironTestCase(common.BleachbitTestCase):
         with mock.patch('bleachbit.Language.get_active_language_code',
                         return_value='it_IT'), \
                 mock.patch('locale.setlocale'), \
+                mock.patch('gettext.find', return_value='bleachbit.mo'), \
                 mock.patch('gettext.translation'), \
                 mock.patch('bleachbit.Unix.find_best_locale',
                            return_value='it_IT'):
             setup_translation()
         self.assertEqual(os.environ.get('LANGUAGE'), 'it_IT')
+
+    @common.skipIfWindows
+    def test_setup_translation_regional_variant(self):
+        """zh_HK uses the shipped zh_TW catalog"""
+        locale_dir = os.path.join(self.mkdtemp(), 'locale')
+        mo_dir = os.path.join(locale_dir, 'zh_TW', 'LC_MESSAGES')
+        os.makedirs(mo_dir)
+        with open(os.path.join(mo_dir, 'bleachbit.mo'), 'wb'):
+            pass
+        with mock.patch('bleachbit.locale_dir', locale_dir), \
+                mock.patch('bleachbit.Language.get_active_language_code',
+                           return_value='zh_HK'), \
+                mock.patch('locale.setlocale'), \
+                mock.patch('locale.bindtextdomain', create=True), \
+                mock.patch('locale.textdomain', create=True), \
+                mock.patch('gettext.translation') as mock_translation, \
+                mock.patch('bleachbit.Unix.find_best_locale',
+                           return_value='zh_HK'):
+            setup_translation()
+        self.assertEqual(mock_translation.call_args.kwargs['languages'],
+                         ['zh_TW'])
+        self.assertEqual(os.environ.get('LANGUAGE'), 'zh_TW')
 
     @common.skipUnlessLinux
     def test_setup_translation_captures_locale_before_setlocale(self):
@@ -522,4 +557,48 @@ class WindowsGettextCacheTestCase(common.BleachbitTestCase):
                 # Restore process gettext state for later tests, after the
                 # environment variables have been restored to their
                 # pre-test values.
+                setup_translation()
+
+
+class MacGettextBindTestCase(common.BleachbitTestCase):
+    """macOS: bind the libintl domain when Python lacks locale.bindtextdomain().
+
+    Without it the Gtk.Builder strings (hamburger menu) stay in English
+    on Python builds such as Homebrew's 3.12.
+    """
+
+    @common.skipUnlessMac
+    def test_setup_translation_binds_libintl_on_mac(self):
+        import locale
+        from bleachbit import Language as language_module
+        from bleachbit.Mac import bind_libintl_domain
+
+        # Simulate a Python build without bindtextdomain() in case the
+        # running macOS Python build provides it.
+        had_bindtextdomain = hasattr(locale, 'bindtextdomain')
+        saved_bindtextdomain = getattr(locale, 'bindtextdomain', None)
+        if had_bindtextdomain:
+            del locale.bindtextdomain
+        with common.set_temporary_env('LANG', os.environ.get('LANG')), \
+                common.set_temporary_env('LANGUAGE', os.environ.get('LANGUAGE')):
+            t_backup = language_module.t
+            try:
+                with mock.patch('bleachbit.Language.get_active_language_code',
+                                return_value='es'), \
+                        mock.patch('bleachbit.GtkShim.is_gtk_loaded',
+                                   return_value=True), \
+                        mock.patch('bleachbit.Mac.bind_libintl_domain',
+                                   wraps=bind_libintl_domain) as bind, \
+                        self.assertLogs('bleachbit.Mac', level='DEBUG') as cm:
+                    setup_translation()
+                bind.assert_called_once()
+                self.assertEqual(bind.call_args[0][0], 'bleachbit')
+                self.assertTrue(
+                    any('libintl text domain bleachbit bound to' in msg
+                        for msg in cm.output),
+                    cm.output)
+            finally:
+                if had_bindtextdomain:
+                    locale.bindtextdomain = saved_bindtextdomain
+                language_module.t = t_backup
                 setup_translation()

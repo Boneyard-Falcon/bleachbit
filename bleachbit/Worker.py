@@ -76,6 +76,8 @@ class Worker:
         self.is_aborted = False
         if not self.operations:
             raise RuntimeError("No work to do")
+        # A folder can have been replaced since the last run
+        FileUtilities.clear_path_spellings()
 
     def abort(self):
         """Stop the preview/cleaning operation"""
@@ -118,8 +120,10 @@ class Worker:
                     filename = FileUtilities.extended_path_undo(filename)
                 # Do not show traceback.
                 logger.error(_("File not found: %s"), filename)
-            elif isinstance(e, OSError) and e.errno == errno.EACCES:
-                # EACCES (Error ACCESS) means access denied.
+            elif isinstance(e, OSError) and e.errno in (
+                    errno.EACCES, errno.ELOOP, errno.ENOTDIR):
+                # EACCES means access denied; ELOOP and ENOTDIR also occur when
+                # O_NOFOLLOW refuses a symlink swapped in for a file or dir.
                 # Do not show traceback.
                 if e.strerror == "Access denied in delete_locked_file()":
                     # This comes from Windows.delete_locked_file()
@@ -142,6 +146,10 @@ class Worker:
                              getattr(cmd, 'path', cmd))
             else:
                 # For other errors, show the traceback.
+                # TRANSLATORS: The special keyword {operation_option} will be
+                # replaced by a cleaner and option such as 'firefox.cache'.
+                # The special keyword {command} will be replaced by the
+                # cleaning action that failed. Do not translate the placeholders.
                 msg = _('Error: {operation_option}: {command}')
                 data = {'command': cmd, 'operation_option': operation_option}
                 logger.error(msg.format(**data), exc_info=True)
@@ -233,6 +241,8 @@ class Worker:
                 _('To stop this process, press the abort button on the toolbar and wait.'))
             self.ui.append_text('\n\n')
             self.ui.append_text(
+                # TRANSLATORS: Warning shown while wiping a drive's
+                # empty space.
                 _('If the application is force closed before the process is complete, '
                   'large files may remain on the disk, and they may use all available space. '
                   'To remove them, start BleachBit again.'))
@@ -291,38 +301,42 @@ class Worker:
                     self.operations[operation].remove(delayable)
                     self.delayed_ops.append((priority, operation, delayable))
 
-        # standard operations
-        with warnings.catch_warnings(record=True) as ws:
-            # This warning system allows general warnings. Duplicate will
-            # be removed, and the warnings will show near the end of
-            # the log.
+        try:
+            # standard operations
+            with warnings.catch_warnings(record=True) as ws:
+                # This warning system allows general warnings. Duplicate will
+                # be removed, and the warnings will show near the end of
+                # the log.
 
-            warnings.simplefilter('once')
-            # simplefilter('once') prepends a catch-all filter that would
-            # capture PyGObject's asyncio deprecation warnings and re-log
-            # them as red errors in the GUI.  Re-install the ignore filter
-            # so it takes precedence over the 'once' filter.
-            ignore_pygobject_asyncio_warnings()
-            for _dummy in self.run_operations(self.operations):
-                # yield to GTK+ idle loop
-                yield True
-            for w in ws:
-                logger.warning(w.message)
+                warnings.simplefilter('once')
+                # simplefilter('once') prepends a catch-all filter that would
+                # capture PyGObject's asyncio deprecation warnings and re-log
+                # them as red errors in the GUI.  Re-install the ignore filter
+                # so it takes precedence over the 'once' filter.
+                ignore_pygobject_asyncio_warnings()
+                for _dummy in self.run_operations(self.operations):
+                    # yield to GTK+ idle loop
+                    yield True
+                for w in ws:
+                    logger.warning(w.message)
 
-        # run deep scan
-        if self.deepscans:
-            yield from self.run_deep_scan()
+            # run deep scan
+            if self.deepscans:
+                yield from self.run_deep_scan()
 
-        # After standard operations and deep scan, close the lock
-        # of the parent directory.
-        close_delete_parent_lock()
+            # After standard operations and deep scan, close the lock
+            # of the parent directory.
+            close_delete_parent_lock()
 
-        # delayed operations
-        for _priority, operation, option_id in sorted(
-                self.delayed_ops, key=lambda op: op[0]):
-            for _ret in self.run_delayed_op(operation, option_id):
-                # yield to GTK+ idle loop
-                yield True
+            # delayed operations
+            for _priority, operation, option_id in sorted(
+                    self.delayed_ops, key=lambda op: op[0]):
+                for _ret in self.run_delayed_op(operation, option_id):
+                    # yield to GTK+ idle loop
+                    yield True
+        finally:
+            # Wiping empty space takes the lock again
+            close_delete_parent_lock()
 
         # print final stats
         bytes_delete = FileUtilities.bytes_to_human(self.total_bytes)
@@ -353,6 +367,8 @@ class Worker:
             line = _("Special operations: %d") % self.total_special
             self.ui.append_text("\n%s" % line)
         if self.total_errors > 0:
+            # TRANSLATORS: %d is the count of errors that occurred
+            # during the cleaning or preview operation.
             line = _("Errors: %d") % self.total_errors
             self.ui.append_text("\n%s" % line, 'error')
         self.ui.append_text('\n')

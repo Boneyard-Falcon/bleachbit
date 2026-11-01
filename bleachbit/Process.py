@@ -10,12 +10,15 @@ Enumerate and terminate processes
 
 import signal
 import glob
+import logging
 import subprocess
 import time
 from collections import namedtuple
 import os
 
 from bleachbit import IS_LINUX, IS_POSIX, IS_WINDOWS
+
+logger = logging.getLogger(__name__)
 
 ProcessInfo = namedtuple('ProcessInfo', ['pid', 'name', 'same_user'])
 
@@ -92,40 +95,42 @@ def _enumerate_psutil_windows():
     """Enumerate processes with psutils on Windows"""
     psutil = _import_psutil()
     current_user = psutil.Process().username().lower()
-    for proc in psutil.process_iter(['name', 'username', 'cmdline']):
+    # On Windows, do not fetch 'cmdline' because it can be much slower
+    # sometimes, and it does not add useful information.
+    start_time = time.time()
+    for proc in psutil.process_iter(['name', 'username']):
         try:
             name = proc.info['name']
             if not name:
                 continue
             same_user = (proc.info['username'] or '').lower() == current_user
-            names = {name}
-            cmdline = proc.info.get('cmdline')
-            if cmdline:
-                names.add(os.path.basename(cmdline[0]))
-            for proc_name in names:
-                if proc_name:
-                    yield ProcessInfo(proc.pid, proc_name, same_user)
+            yield ProcessInfo(proc.pid, name, same_user)
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             continue
+    elapsed = time.time() - start_time
+    if elapsed >= 0.5:
+        log_func = logger.warning if elapsed >= 2.0 else logger.debug
+        log_func('process enumeration took %.1f seconds', elapsed)
 
 
-def _enumerate_proc_fs():
+def _enumerate_proc_fs(proc_dir='/proc'):
     """/proc filesystem strategy (Linux)"""
     from bleachbit.General import get_real_uid
     target_uid = get_real_uid()
-    for filename in glob.iglob("/proc/*/exe"):
+    for filename in glob.iglob(os.path.join(glob.escape(proc_dir), '*/exe')):
         pid_dir = os.path.dirname(filename)
         base = os.path.basename(pid_dir)
         if not base.isdigit():
             # skip /proc/self and /proc/thread-self
             continue
         pid = int(base)
-        name = None
+        exe = None
         try:
-            target = os.path.realpath(filename)
+            # realpath() no longer raises on EACCES in Python 3.13+
+            target = os.readlink(filename)
             # Google Chrome 74 on Ubuntu 19.04 showed up as
             # /opt/google/chrome/chrome (deleted)
-            name = os.path.basename(target).replace(' (deleted)', '')
+            exe = os.path.basename(target).replace(' (deleted)', '')
         except OSError:
             # 13 = permission denied
             pass
@@ -134,22 +139,29 @@ def _enumerate_proc_fs():
             # '/etc/password\x00 (deleted)'
             pass
 
-        if not name:
-            try:
-                with open(os.path.join(pid_dir, 'stat'), 'r',
-                          encoding='utf-8') as f:
-                    stat_content = f.read()
-                # comm is field 2, wrapped in parens, and may contain spaces
-                name = stat_content[stat_content.index('(') + 1:
-                                    stat_content.rindex(')')]
-            except (OSError, ValueError):
-                continue
+        # A shebang script (e.g. dnf) has exe='python3.x' and argv[0]='python3',
+        # so only comm names the script itself.
+        comm = None
+        try:
+            with open(os.path.join(pid_dir, 'stat'), 'r',
+                      encoding='utf-8') as f:
+                stat_content = f.read()
+            # comm is field 2, wrapped in parens, and may contain spaces
+            comm = stat_content[stat_content.index('(') + 1:
+                                stat_content.rindex(')')]
+        except (OSError, ValueError):
+            # process exited or stat is unreadable; exe may still match
+            pass
+
+        if not exe and not comm:
+            continue
+
         try:
             same_user = os.stat(pid_dir).st_uid == target_uid
         except OSError:
             # the process exited between listing and stat
             same_user = False
-        yield ProcessInfo(pid, name, same_user)
+
         # argv[0] may differ from the exe name (e.g. a versioned binary
         # launched through a symlink)
         try:
@@ -158,8 +170,9 @@ def _enumerate_proc_fs():
                     f.read().split(b'\x00')[0].decode('utf-8', 'replace'))
         except OSError:
             argv0 = ''
-        if argv0 and argv0 != name:
-            yield ProcessInfo(pid, argv0, same_user)
+
+        for proc_name in {exe, comm, argv0} - {None, ''}:
+            yield ProcessInfo(pid, proc_name, same_user)
 
 
 def _enumerate_ps_aux():
@@ -224,6 +237,12 @@ def is_process_running(exename, require_same_user):
     return False
 
 
+def is_pid_running(pid, require_same_user):
+    """Check whether a process with this PID is running"""
+    return any(proc.pid == pid and (not require_same_user or proc.same_user)
+               for proc in process_cache.get())
+
+
 def terminate_process(exename, require_same_user):
     """Terminate processes matching exename. Returns list of affected PIDs."""
     ci = IS_WINDOWS
@@ -238,7 +257,16 @@ def terminate_process(exename, require_same_user):
                 continue
             try:
                 if IS_WINDOWS:
-                    _import_psutil().Process(proc.pid).kill()
+                    psutil = _import_psutil()
+                    try:
+                        p = psutil.Process(proc.pid)
+                        p.kill()
+                        p.wait(timeout=3)
+                    except psutil.TimeoutExpired:
+                        # killed but still exiting
+                        pass
+                    except psutil.Error:
+                        continue
                 else:
                     os.kill(proc.pid, signal.SIGTERM)
                 terminated.append(proc.pid)

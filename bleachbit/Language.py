@@ -323,6 +323,9 @@ def get_supported_language_codes():
                     supported_langs.append(lang)
             except FileNotFoundError:
                 logger.debug('no compiled translation for language %s', lang)
+            except Exception as e:
+                # a damaged catalog must not stop the startup
+                logger.warning('Skipping the %s translation: %s', lang, e)
     return supported_langs
 
 
@@ -519,8 +522,17 @@ def setup_translation():
     logger.debug("user_locale: %s, locale_dir: %s", user_locale, locale_dir)
     assert isinstance(user_locale, str)
     assert isinstance(locale_dir, str), f"locale_dir: {locale_dir}"
+    text_domain = 'bleachbit'
+    # gettext falls back only to the bare language, so zh_HK would miss the
+    # shipped zh_TW. English is the source language and has no catalog.
+    translation_locale = user_locale
+    loc = LocaleCode(user_locale)
+    if not loc.is_special and loc.language != 'en' and \
+            not gettext.find(text_domain, locale_dir, [user_locale]):
+        translation_locale = find_supported_language_code(
+            user_locale, get_supported_language_codes()) or user_locale
     if IS_WINDOWS and user_locale:
-        os.environ['LANG'] = user_locale
+        os.environ['LANG'] = translation_locale
     elif IS_POSIX and user_locale:
         # GLib's own g_get_language_names() (used by Gtk.Builder to
         # translate .ui files like the hamburger menu) reads LANGUAGE
@@ -549,11 +561,10 @@ def setup_translation():
         # started later with 'Fatal Python error:
         # config_get_locale_encoding: ... nl_langinfo(CODESET) failed'
         # when this was tried with LANG/LC_ALL instead.
-        os.environ['LANGUAGE'] = user_locale
-    text_domain = 'bleachbit'
+        os.environ['LANGUAGE'] = translation_locale
     try:
         t = gettext.translation(
-            domain=text_domain, localedir=locale_dir, languages=[user_locale], fallback=True)
+            domain=text_domain, localedir=locale_dir, languages=[translation_locale], fallback=True)
     except FileNotFoundError as e:
         logger.error(
             "Error in setup_translation() with language code %s: %s", user_locale, e)
@@ -595,9 +606,15 @@ def setup_translation():
         # Log for debugging
         logger.debug("Windows translation domain set to: %s, dir: %s",
                      text_domain, locale_dir)
+    elif gtk_loaded and IS_MAC:
+        # Python builds for macOS lack locale.bindtextdomain(), so call
+        # libintl directly, so Gtk.Builder finds bleachbit.mo translations.
+        # Import here because bleachbit.Mac imports this module.
+        from bleachbit.Mac import bind_libintl_domain
+        if not bind_libintl_domain(text_domain, locale_dir):
+            logger.warning('Failed to bind the translation domain; '
+                           'the GUI may not be translated.')
     elif gtk_loaded:
-        # FIXME (macOS): call libintl.dylib's bindtextdomain() via ctypes
-        # like Windows, so Gtk.Builder finds bleachbit.mo translations.
         logger.warning('The function bindtextdomain() is not available.')
 
     # locale.setlocale() on Linux will throw an exception if the locale is not

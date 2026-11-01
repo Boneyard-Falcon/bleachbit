@@ -62,10 +62,11 @@ class Delete:
     """Delete a single file or directory.  Obey the user
     preference regarding shredding."""
 
-    def __init__(self, path, shred=False):
+    def __init__(self, path, shred=False, top=None):
         """Create a Delete instance to delete 'path'"""
         self.path = path
         self.shred = shred
+        self.top = top
 
     def __str__(self):
         return f'Command to {"shred" if self.shred else "delete"} {self.path}'
@@ -98,7 +99,8 @@ class Delete:
             'size': size}
         if really_delete:
             try:
-                deleted = FileUtilities.delete(self.path, self.shred)
+                deleted = FileUtilities.delete(
+                    self.path, self.shred, top=self.top)
             # pylint: disable-next=possibly-used-before-assignment
             except WindowsError as e:
                 # WindowsError: [Error 32] The process cannot access the file because it is being
@@ -107,10 +109,14 @@ class Delete:
                 if not e.winerror == 32:
                     raise
 
+                # Like delete(), use the \\?\ path so long paths work
                 # pylint: disable-next=possibly-used-before-assignment
-                bleachbit.Windows.delete_locked_file(self.path)
+                bleachbit.Windows.delete_locked_file(
+                    FileUtilities.extended_path(self.path))
 
-                if self.shred:
+                # delete() also shreds when the global option is on
+                from bleachbit.Options import options
+                if self.shred or options.get('shred'):
                     warnings.warn(
                         # TRANSLATORS: Warning message shown in the progress log.
                         _('At least one file was locked by another process, '
@@ -124,6 +130,34 @@ class Delete:
                     ret['n_deleted'] = 0
                     ret['size'] = 0
         yield ret
+
+
+class DeleteRecycleBinMetadata(Delete):
+
+    """Delete a recycle-bin record only after its payload has disappeared."""
+
+    def __init__(self, path, payload):
+        super().__init__(path)
+        self.payload = payload
+
+    def execute(self, really_delete):
+        if FileUtilities.whitelisted(self.payload):
+            yield ret_keep_list(self.path)
+            return
+        if really_delete:
+            try:
+                os.lstat(FileUtilities.extended_path(self.payload))
+            except FileNotFoundError:
+                pass
+            else:
+                # This also preserves restore information for kept descendants
+                # and for payloads whose deletion failed or awaits a reboot.
+                return
+        try:
+            os.lstat(FileUtilities.extended_path(self.path))
+        except FileNotFoundError:
+            return
+        yield from super().execute(really_delete)
 
 
 class Function:

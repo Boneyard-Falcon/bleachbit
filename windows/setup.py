@@ -77,7 +77,6 @@ if not os.path.exists(NSIS_EXE) and os.path.exists(NSIS_ALT_EXE):
 SZ_EXE = 'C:\\Program Files\\7-Zip\\7z.exe'
 UPX_EXE = shutil.which('upx') or (ROOT_DIR + '\\upx\\upx.exe')
 UPX_OPTS = '--best --nrv2e'
-STRIP_EXE = shutil.which('strip')
 ADVZIP_EXE = shutil.which('advzip') or (ROOT_DIR + '\\advancecomp\\advzip.exe')
 
 
@@ -86,10 +85,10 @@ def get_build_settings():
 
     Presets:
       fast       - enable quick mode for PR builds
-                   * skip UPX, strip, and the library.zip repack
+                   * skip UPX and the library.zip repack
                    * set faster compression for .zip and NSIS
       regular    - default build
-                   * enables strip and the stored library.zip repack
+                   * enables the stored library.zip repack
                    * set maximum compression for .zip and NSIS
       max-effort - enable Deadpool mode for release builds
                    * build English-only installer
@@ -119,7 +118,6 @@ def get_build_settings():
         'upx_tag': '-upx' if upx_enabled else '',  # filename tag for UPX builds
         # recompress zips with advzip
         'advzip': is_max_effort and bool(os.path.exists(ADVZIP_EXE)),
-        'strip': not is_fast and bool(STRIP_EXE),  # strip executables
         'recompress_lib': not is_fast,  # prune and repack library.zip
     }
 
@@ -225,11 +223,17 @@ def assert_execute(args, expected_output, timeout=120):
     try:
         actual_output = subprocess.check_output(
             args, stderr=subprocess.STDOUT, timeout=timeout).decode(SetupEncoding)
+    except subprocess.CalledProcessError as e:
+        output = (e.output or b'').decode(SetupEncoding, errors='replace')
+        logger.error('Command %s failed with exit code %s. Output:\n%s',
+                     args, e.returncode, output)
+        raise
     except subprocess.TimeoutExpired as e:
         partial = (e.output or b'').decode(SetupEncoding, errors='replace')
         logger.error('Command %s timed out after %ss. Partial output:\n%s',
                      args, timeout, partial)
         raise RuntimeError(f'Timeout running {args} after {timeout}s') from e
+    logger.info(actual_output.rstrip())
     if -1 == actual_output.find(expected_output):
         raise RuntimeError(
             f'When running command {args} expected output {expected_output} but got {actual_output}')
@@ -242,7 +246,14 @@ def assert_execute_console():
                    'Success')
 
 
-def run_cmd(cmd, check=True, log_cmd=True):
+def assert_execute_comms_check():
+    """Check the network stack (requests, TLS, CA bundle)"""
+    logger.info('Check the frozen network stack can talk')
+    assert_execute([r'dist\bleachbit_console.exe', '--comms-check', '--no-uac'],
+                   'FIVE BY FIVE')
+
+
+def run_cmd(cmd, check=True, log_cmd=True, env=None):
     """Run a command and log the output
 
     Return the exit code. If check is true, a non-zero exit code aborts.
@@ -255,7 +266,8 @@ def run_cmd(cmd, check=True, log_cmd=True):
         else:
             logger.info(cmd)
     with subprocess.Popen(cmd, stdin=subprocess.PIPE,
-                          stdout=subprocess.PIPE, stderr=subprocess.PIPE) as p:
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                          env=env) as p:
         stdout, stderr = p.communicate()
         if stdout:
             logger.info(stdout.decode(SetupEncoding))
@@ -602,16 +614,9 @@ def build():
         path = os.path.join(gtk_share, d)
         copy_tree(path, os.path.join('dist', 'share', d))
 
-    logger.info('Fixing paths in loaders.cache file')
-    loaders_fn = os.path.join(
-        'dist', 'lib', 'gdk-pixbuf-2.0', '2.10.0', 'loaders.cache')
-    with open(loaders_fn, 'r+', encoding=SetupEncoding) as f:
-        data = f.read()
-        data = re.sub(r'^".*[/\\](.*\.dll)"$',
-                      r'"\1"', data, flags=re.I | re.M)
-        f.seek(0)
-        f.write(data)
-        f.truncate()
+    # The startup checks before shrink() rebuilds it need working paths
+    fix_loaders_cache_paths(os.path.join(
+        'dist', 'lib', 'gdk-pixbuf-2.0', '2.10.0', 'loaders.cache'))
 
     schemas_dir = 'share\\glib-2.0\\schemas'
     gschemas_compiled_src = os.path.join(
@@ -707,7 +712,6 @@ def delete_unnecessary():
     # Error loading theme icon 'dialog-warning' for stock: Unable to load image-loading module: C:/PythonXY/Lib/site-packages/gtk-2.0/runtime/lib/gdk-pixbuf-2.0/2.10.0/loaders/libpixbufloader-svg.dll: `C:/PythonXY/Lib/site-packages/gtk-2.0/runtime/lib/gdk-pixbuf-2.0/2.10.0/loaders/libpixbufloader-svg.dll': The specified module could not be found.
     # https://bugs.launchpad.net/bleachbit/+bug/1650907
     delete_paths = [
-        r'_multiprocessing.pyd',
         r'_queue.pyd',
         r'_win32sysloader.pyd',
         r'perfmon.pyd',
@@ -806,73 +810,6 @@ def clean_translations():
         if pt not in supported_translations:
             path = 'dist/share/locale/' + pt
             shutil.rmtree(path)
-
-
-@count_size_improvement
-def strip():
-    """Strip executables to reduce size"""
-    if not STRIP_EXE:
-        logger.warning('strip.exe does not exist. Skipping strip.')
-        return
-    strip_patterns = ['*.dll', '*.pyd']
-    strip_keep_list = ['_sqlite3.dll']
-    strip_list = recursive_glob('dist', strip_patterns)
-    strip_files_str = [f for f in strip_list if os.path.basename(
-        f) not in strip_keep_list]
-    logger.info('Stripping %d executables matching %s except %d filename%s',
-                len(strip_files_str),
-                ' '.join(strip_patterns),
-                len(strip_keep_list),
-                '' if len(strip_keep_list) == 1 else 's')
-    strip_tmp_fn = 'strip.tmp'
-    # Process each file individually in case it is locked. See
-    # https://github.com/bleachbit/bleachbit/issues/690
-    for strip_file in strip_files_str:
-        delete_file(strip_tmp_fn)
-        if not os.path.exists(strip_file):
-            logger.error('%s does not exist before stripping', strip_file)
-            continue
-        cmd = [STRIP_EXE, '--strip-debug', '--discard-all',
-               '--preserve-dates', '-o', strip_tmp_fn, strip_file]
-        returncode = run_cmd(cmd, check=False, log_cmd=False)
-        if returncode:
-            logger.error('strip.exe exited with code %d for %s',
-                         returncode, strip_file)
-            delete_file(strip_tmp_fn)
-            continue
-        if not os.path.exists(strip_file):
-            delete_file(strip_tmp_fn)
-            raise RuntimeError(f"{strip_file} disappeared after stripping")
-        if not os.path.exists(strip_tmp_fn):
-            logger.warning('%s was not produced by stripping %s',
-                           strip_tmp_fn, strip_file)
-            continue
-
-        # A kernel file system filter driver may briefly lock the file
-        # after strip.exe reads it, so we have a retry loop.
-        # https://github.com/bleachbit/bleachbit/issues/690
-        replaced = False
-        for attempt in range(100):
-            try:
-                os.replace(strip_tmp_fn, strip_file)  # atomic replace
-                replaced = True
-                break
-            except PermissionError:
-                if attempt == 0:
-                    logger.warning(
-                        'permissions error while replacing %s (retrying)',
-                        strip_file)
-                else:
-                    logger.debug(
-                        'retry %d replacing %s', attempt + 1, strip_file)
-                time.sleep(.1)
-        if not replaced:
-            logger.error(
-                'failed to replace %s after 100 retries; '
-                'keeping original (unstripped) and discarding %s',
-                strip_file, strip_tmp_fn)
-        delete_file(strip_tmp_fn)
-#    assert_execute_console()
 
 
 @count_size_improvement
@@ -1008,8 +945,6 @@ def repack_library(settings):
                 f'{file_size_new - file_size_old:+,}', f'{file_size_old:,}', f'{file_size_new:,}')
     shutil.rmtree('dist\\library', ignore_errors=True)
     assert_exist('dist\\library.zip')
-    # Nothing else runs the exe after library.zip is rewritten
-    assert_execute_console()
 
 
 def shrink(settings):
@@ -1019,8 +954,6 @@ def shrink(settings):
     delete_unused_themes()
     clean_translations()
     remove_empty_dirs('dist')
-    if settings['strip']:
-        strip()
     if settings['upx']:
         upx()
     clean_dist_locale()
@@ -1030,9 +963,61 @@ def shrink(settings):
     if settings['recompress_lib']:
         repack_library(settings)
 
+    rebuild_loaders_cache()
+
     # so calculate the size of the folder, as it is a goal to shrink it.
     logger.info('Final size of the dist folder: %s',
                 f'{get_dir_size("dist"):,}')
+
+    # After all the shrink changes, check that the app still works.
+    assert_execute_console()
+    assert_execute_comms_check()
+
+
+def rebuild_loaders_cache():
+    """Rebuild loaders.cache from what dist ships
+
+    Run after the pruning in shrink() so a DLL the SVG loader needs
+    fails the build when it's missing or was pruned.
+    """
+    logger.info('Rebuilding loaders.cache file')
+    # The GTK bundle's copy can predate the SVG loader and list nothing
+    dist_dir = os.path.abspath('dist')
+    pixbuf_dir = os.path.join(dist_dir, 'lib', 'gdk-pixbuf-2.0', '2.10.0')
+    loaders_fn = os.path.join(pixbuf_dir, 'loaders.cache')
+    query_loaders = os.path.join(
+        GTK_DIR, 'tools', 'gdk-pixbuf', 'gdk-pixbuf-query-loaders.exe')
+    assert_exist(query_loaders)
+    # Windows looks next to the exe first and the bundle keeps its own
+    # glib etc. there, so run a copy that can only find the DLLs in dist
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        tmp_exe = shutil.copy(query_loaders, tmp_dir)
+        env = dict(os.environ,
+                   GDK_PIXBUF_MODULEDIR=os.path.join(pixbuf_dir, 'loaders'),
+                   GDK_PIXBUF_MODULE_FILE=loaders_fn,
+                   PATH=dist_dir)
+        run_cmd([tmp_exe, '--update-cache'], env=env)
+    data = fix_loaders_cache_paths(loaders_fn)
+    # query-loaders skips a loader it can't load and still exits 0
+    if '"pixbufloader-svg.dll"' not in data:
+        logger.error('%s has no SVG loader', loaders_fn)
+        sys.exit(1)
+
+
+def fix_loaders_cache_paths(loaders_fn):
+    """Strip the directories from the loader paths in loaders.cache
+
+    GdkPixbuf finds a bare file name in its loaders folder, wherever dist is.
+    Return the new contents.
+    """
+    with open(loaders_fn, 'r+', encoding=SetupEncoding) as f:
+        data = f.read()
+        data = re.sub(r'^".*[/\\](.*\.dll)"$',
+                      r'"\1"', data, flags=re.I | re.M)
+        f.seek(0)
+        f.write(data)
+        f.truncate()
+    return data
 
 
 def keep_font_cache_in_portable(portable_dir):
@@ -1046,9 +1031,14 @@ def keep_font_cache_in_portable(portable_dir):
     with open(fn, encoding='utf-8', newline='') as f:
         data = f.read()
     anchor = '<cachedir>LOCAL_APPDATA_FONTCONFIG_CACHE</cachedir>'
+    cachedir = '<cachedir>/var/cache/fontconfig</cachedir>'
+    if cachedir in data:
+        # Just copied from dist, so the installer would ship it too
+        logger.error('%s already contains %s', fn, cachedir)
+        sys.exit(1)
     data, count = re.subn(
         rf'^([ \t]*)({re.escape(anchor)})(\r?\n)',
-        r'\1<cachedir>/var/cache/fontconfig</cachedir>\3\1\2\3',
+        rf'\1{cachedir}\3\1\2\3',
         data, count=1, flags=re.M)
     if not count:
         logger.error('%s not found in %s', anchor, fn)
@@ -1154,8 +1144,8 @@ def main():
     logger.info('BleachBit version %s', get_version())
     environment_check()
     settings = get_build_settings()
-    logger.info('Build preset: %s (UPX: %s, AdvZip: %s, Strip: %s)',
-                settings['preset'], settings['upx'], settings['advzip'], settings['strip'])
+    logger.info('Build preset: %s (UPX: %s, AdvZip: %s)',
+                settings['preset'], settings['upx'], settings['advzip'])
     build()
     shrink(settings)
     package_portable(settings)

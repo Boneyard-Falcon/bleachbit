@@ -108,7 +108,8 @@ def update_dialog(parent, updates):
 def check_updates(check_beta, check_winapp2, append_text, cb_success):
     """Check for updates via the Internet
 
-    Returns a list of (ver, url) pairs, empty when there is no update.
+    Returns a list of (ver, url) pairs, empty when the check succeeded
+    and there is no update, or None when the check itself failed.
     """
     url = bleachbit.update_check_url
     if 'windowsapp' in sys.executable.lower():
@@ -116,13 +117,13 @@ def check_updates(check_beta, check_winapp2, append_text, cb_success):
     try:
         response = fetch_url(url,
                              headers=get_update_request_headers())
-    except RequestException as e:
+    except (RequestException, OSError) as e:
         logger.error(
             _('Error when opening a network connection to check for updates. Please verify the network is working and that a firewall is not blocking this application. Error message: {}').format(e))
         logger.debug('URL %s has IP address %s', url, get_ip_for_url(url))
         if HAVE_REQUESTS and hasattr(e, 'response') and e.response is not None:
             logger.debug(e.response.headers)
-        return []
+        return None
     try:
         # pyexpat rejects a str carrying an encoding declaration; pass bytes
         reject_xml_dtd(response.content, 'update XML')
@@ -130,7 +131,7 @@ def check_updates(check_beta, check_winapp2, append_text, cb_success):
     except Exception:
         logger.exception(
             'The update information does not parse: %s', response.text)
-        return []
+        return None
 
     def parse_updates(element):
         """Return a (ver, url) pair, or None when there is nothing usable"""
@@ -153,7 +154,10 @@ def check_updates(check_beta, check_winapp2, append_text, cb_success):
     if check_winapp2 and wa_element:
         wa_sha512 = wa_element[0].getAttribute('sha512')
         wa_url = wa_element[0].getAttribute('url')
-        update_winapp2(wa_url, wa_sha512, append_text, cb_success)
+        try:
+            update_winapp2(wa_url, wa_sha512, append_text, cb_success)
+        except Exception as e:
+            logger.error('Failed to update winapp2.ini: %s', e)
 
     dom.unlink()
 

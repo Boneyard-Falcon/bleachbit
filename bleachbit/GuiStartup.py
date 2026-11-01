@@ -11,7 +11,7 @@ import sys
 from importlib.util import find_spec
 
 import bleachbit
-from bleachbit import IS_MAC, IS_POSIX, IS_WINDOWS
+from bleachbit import General, IS_MAC, IS_POSIX, IS_WINDOWS, SystemInformation
 from bleachbit.General import unset_sslkeylogfile
 from bleachbit.Language import get_text as _
 from bleachbit.Options import options
@@ -160,8 +160,8 @@ def _get_windows_file_owner(filepath):
     return file_owner_sid_str, file_owner_name
 
 
-def _get_windows_permission_issues(options_file):
-    """Check Windows-specific ownership issues.
+def _get_windows_permission_issues(options_file, options_dir=None):
+    """Check Windows-specific ownership and ACL issues.
 
     Returns (has_error, lines).
     """
@@ -179,8 +179,7 @@ def _get_windows_permission_issues(options_file):
         # from the owner. This is not representative of a normal installation.
         if 'GITHUB_ACTIONS' in os.environ and file_owner_name == 'Administrators':
             lines.append('Skipping file ownership check in CI')
-            return False, lines
-        if file_owner_sid_str != current_sid and file_owner_sid_str not in group_sids:
+        elif file_owner_sid_str != current_sid and file_owner_sid_str not in group_sids:
             if file_owner_name == file_owner_sid_str:
                 # The file owner's SID could not be resolved to an account
                 # name (e.g., issue #2271).
@@ -193,12 +192,32 @@ def _get_windows_permission_issues(options_file):
     except Exception as e:
         has_error = True
         lines.append(f'Could not check file ownership: {e}')
+
+    # When elevated, GUI.check_appdata_permissions() offers the repair instead.
+    if (options_dir and not bleachbit.portable_mode
+            # pylint: disable-next=possibly-used-before-assignment
+            and not Windows.shell.IsUserAnAdmin()):
+        try:
+            if Windows.has_broken_appdata_acl(options_dir):
+                has_error = True
+                lines.append(
+                    'Configuration folder permissions lock out non-elevated '
+                    'processes (issue #2401); run BleachBit with administrator '
+                    'privileges to repair them')
+        except Exception as e:
+            has_error = True
+            lines.append(f'Could not check directory ACL: {e}')
+
     return has_error, lines
 
 
 def _get_config_permission_issues():
     """Check for permission and file access issues with the
     configuration.
+
+    Side effects: creates the options directory and an empty
+    configuration file if they are missing. In sudo mode, chowns
+    them to the real user.
 
     If no errors, returns False.
     If errors found, returns list of strings with info.
@@ -208,6 +227,28 @@ def _get_config_permission_issues():
 
     _options_file = bleachbit.options_file
     _options_dir = bleachbit.options_dir
+
+    try:
+        General.makedirs(_options_dir)
+    except OSError as e:
+        lines.append(f'Cannot create directory {_options_dir}: '
+                     f'{type(e).__name__}: {e}')
+        parent = os.path.dirname(_options_dir)
+        while not os.path.lexists(parent) and parent != os.path.dirname(parent):
+            parent = os.path.dirname(parent)
+        try:
+            pstat = os.stat(parent)
+            lines.append(f'Nearest existing parent directory: {parent}')
+            lines.append(
+                f'Parent directory permissions: {stat.filemode(pstat.st_mode)} '
+                f'({oct(stat.S_IMODE(pstat.st_mode))})')
+            if IS_POSIX:
+                lines.extend(_get_posix_permission_issues(pstat, parent)[1])
+            elif IS_WINDOWS:
+                lines.extend(_get_windows_permission_issues(parent)[1])
+        except OSError as e2:
+            lines.append(f'Cannot stat parent directory {parent}: {e2}')
+        return lines
 
     try:
         with open(_options_file, 'rb') as f:
@@ -222,8 +263,11 @@ def _get_config_permission_issues():
         lines.append(f"Read error: {type(e).__name__}: {e}")
 
     try:
+        mkfile = not os.path.exists(_options_file)
         with open(_options_file, 'a', encoding='utf-8') as f:
             f.write('')
+        if mkfile and General.sudo_mode():
+            General.chownself(_options_file)
     except (IOError, OSError, PermissionError) as e:
         has_error = True
         lines.append(f"Write error: {type(e).__name__}: {e}")
@@ -250,17 +294,16 @@ def _get_config_permission_issues():
         lines.append(f'Cannot stat directory {_options_dir}: {e}')
 
     # File ownership vs current user
-    if 'fstat' in locals():
-        if IS_POSIX:
-            _has_error, _lines = _get_posix_permission_issues(
-                fstat, _options_file)
-            has_error = has_error or _has_error
-            lines.extend(_lines)
-        elif IS_WINDOWS:
-            _has_error, _lines = _get_windows_permission_issues(
-                _options_file)
-            has_error = has_error or _has_error
-            lines.extend(_lines)
+    if IS_POSIX and 'fstat' in locals():
+        _has_error, _lines = _get_posix_permission_issues(
+            fstat, _options_file)
+        has_error = has_error or _has_error
+        lines.extend(_lines)
+    elif IS_WINDOWS:
+        _has_error, _lines = _get_windows_permission_issues(
+            _options_file, _options_dir)
+        has_error = has_error or _has_error
+        lines.extend(_lines)
 
     if has_error:
         return lines
@@ -400,5 +443,15 @@ def get_startup_messages(auto_exit):
                   'access to some files, and some cleaners will not work.\n\n'
                   'To fix this, open System Settings > Privacy & Security > Full Disk '
                   'Access, turn on BleachBit, and then restart BleachBit.'), True))
+
+    # The outdated-build notice is the offline fallback used only when
+    # the online update check cannot report whether a newer version
+    # exists: the check is disabled here, or (when it does run) it
+    # fails and GuiWindow.check_online_updates adds the notice then.
+    if (auto_exit or not bleachbit.online_update_notification_enabled
+            or not options.get('check_online_updates')):
+        notice = SystemInformation.get_outdated_build_notice()
+        if notice:
+            ret_msgs.append((notice, False))
 
     return ret_msgs

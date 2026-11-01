@@ -53,7 +53,7 @@
 %endif
 
 Name:           bleachbit
-Version:        6.0.5
+Version:        6.0.6
 Release:        1%{?dist}
 Summary:        Remove unnecessary files, free space, and maintain privacy
 License:        GPL-3.0-or-later
@@ -71,6 +71,7 @@ Requires(post): desktop-file-utils
 Requires(postun): desktop-file-utils
 Requires:       python3
 Requires:       gtk3
+Requires:       hicolor-icon-theme
 Requires:       python3-gobject
 Requires:       python3-psutil
 Requires:       python3-requests
@@ -79,13 +80,14 @@ Requires:       polkit
 
 %if 0%{?is_opensuse}
 BuildRequires:  desktop-file-utils
+BuildRequires:  hicolor-icon-theme
 BuildRequires:  make
 BuildRequires:  %{pyprefix}
 BuildRequires:  python-rpm-macros
 BuildRequires:  %{pyprefix}-base
 # Leap 16.x split the unversioned /usr/bin/python3 symlink into a separate
 # python3-base package that is no longer pulled in transitively by
-# python313-base. Require it explicitly so %{__python3} resolves.
+# python313-base. Require it explicitly so %%{__python3} resolves.
 %if %{is_leap} && 0%{?suse_version} >= 1600
 BuildRequires:  python3-base
 %endif
@@ -98,6 +100,7 @@ BuildRequires:  %{pyprefix}-sqlite-utils
 BuildRequires:  %{pyprefix}-xml
 BuildRequires:  update-desktop-files
 Requires:       gobject-introspection
+Requires:       hicolor-icon-theme
 Requires:       %{pyprefix}
 Requires:       %{pyprefix}-gobject
 Requires:       %{pyprefix}-gobject-Gdk
@@ -137,6 +140,7 @@ make delete_windows_files
 
 
 %install
+make check-revision
 make install PYTHON=%{pyexe} DESTDIR=%{buildroot} prefix=%{_prefix}
 
 %if %{is_redhat_family}
@@ -201,6 +205,7 @@ update-desktop-database &> /dev/null ||:
 %{_datadir}/applications/org.bleachbit.BleachBit-root.desktop
 %{_datadir}/%{name}/
 %{_datadir}/pixmaps/%{name}.png
+%{_datadir}/icons/hicolor/scalable/apps/%{name}.svg
 %dir %{_datadir}/polkit-1
 %dir %{_datadir}/polkit-1/actions
 %{_datadir}/polkit-1/actions/org.bleachbit.policy
@@ -208,6 +213,6 @@ update-desktop-database &> /dev/null ||:
 
 %changelog
 
-* Tue Mar 18 2025 Andrew Ziem <andrew@bleachbit.org> - 6.0.5-1
-- Update to 6.0.5
+* Tue Mar 18 2025 Andrew Ziem <andrew@bleachbit.org> - 6.0.6-1
+- Update to 6.0.6
 - See https://www.bleachbit.org/news

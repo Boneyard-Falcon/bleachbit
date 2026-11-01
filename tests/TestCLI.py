@@ -11,7 +11,6 @@ Test case for module CLI
 
 # standard imports
 import copy
-import datetime
 import errno
 import io
 import locale
@@ -92,12 +91,24 @@ class CLITestCase(common.BleachbitTestCase):
     def test_args_to_operations(self):
         """Unit test for args_to_operations()"""
         # test explicit cleaners (without --preset or --all-but-warning)
+        # adobe_reader is used here only as a stable example cleaner for
+        # testing wildcard/exclusion parsing. Its 'logs' option is macOS-only
+        # and its 'mru'/'tmp' options are excluded on macOS
+        # (cleaners/adobe_reader.xml), so the expected option set differs by
+        # platform.
+        if bleachbit.IS_MAC:
+            adobe_reader_options = ['cache', 'logs']
+        else:
+            adobe_reader_options = ['cache', 'mru', 'tmp']
+        adobe_reader_options_no_cache = [
+            o for o in adobe_reader_options if o != 'cache']
+
         tests = (
             (['adobe_reader.*'], [],
-             {'adobe_reader': ['cache', 'mru', 'tmp']}),
+             {'adobe_reader': adobe_reader_options}),
             (['adobe_reader.mru'], [], {'adobe_reader': ['mru']}),
             (['adobe_reader.*'], ['adobe_reader.cache'],
-             {'adobe_reader': ['mru', 'tmp']}))
+             {'adobe_reader': adobe_reader_options_no_cache}))
         for test_args, excludes, expected in tests:
             o = args_to_operations(test_args, False, False, excludes)
             self.assertIsInstance(o, dict)
@@ -154,8 +165,7 @@ class CLITestCase(common.BleachbitTestCase):
             'bleachbit.CLI',
             'bleachbit.CleanerML',
             'ERROR',
-            'DEBUG',
-            datetime.datetime.now().strftime('%Y-%m-%d')
+            'DEBUG'
         ]
 
         for delimiter in (' ', '='):
@@ -181,6 +191,14 @@ class CLITestCase(common.BleachbitTestCase):
                 for stderr_forbidden_text in stderror_forbidden_texts:
                     self.assertNotIn(stderr_forbidden_text, stderr,
                                      f"The text '{stderr_forbidden_text}' was found in stderr")
+
+                # The file handler stamps each record with a timestamp
+                # such as "2026-10-30 18:57:15,591", which must not leak
+                # into stderr. Match the timestamp rather than the bare
+                # date because the console output may legitimately
+                # contain a date (e.g. "Build date = 2026-10-30").
+                self.assertNotRegex(
+                    stderr, r'\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3}')
 
                 for required_text in file_required_texts:
                     self.assertIn(required_text, log_content,
@@ -266,7 +284,7 @@ class CLITestCase(common.BleachbitTestCase):
 
                 # the defaults bind this iteration's values into the closure
                 # pylint: disable-next=unused-argument, dangerous-default-value
-                def dummy_delete(path, shred=False, crash=crash,
+                def dummy_delete(path, shred=False, top=None, crash=crash,
                                  deleted_paths=deleted_paths, filename=filename):
                     try:
                         self.assertLExists(path)

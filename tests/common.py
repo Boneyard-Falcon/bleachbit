@@ -13,11 +13,14 @@ Common code for unit tests
 # pylint: disable=protected-access
 
 import contextlib
+import http.server
 import os
 import re
 import shutil
+import socketserver
 import sys
 import tempfile
+import threading
 import time
 import unittest
 import warnings
@@ -62,6 +65,7 @@ from bleachbit.Bootstrap import bootstrap
 from bleachbit.GtkShim import ignore_pygobject_asyncio_warnings
 from bleachbit.FileUtilities import (
     children_in_directory,
+    close_delete_parent_lock,
     extended_path,
     get_filesystem_type,
     is_hard_link,
@@ -240,6 +244,18 @@ class BleachbitTestCase(unittest.TestCase):
         cls.tempdir = tempfile.mkdtemp(prefix=cls.__name__)
         if 'BLEACHBIT_TEST_OPTIONS_DIR' not in os.environ:
             cls._patch_options_paths()
+        if bleachbit.IS_WINDOWS:
+            # mkdtemp() leaves a protected 0o700 DACL on the bleachbit-test-*
+            # ancestors; reset them outside-in (issue #2401).
+            ancestors = []
+            parent = os.path.dirname(cls.tempdir)
+            while os.path.basename(parent).startswith('bleachbit-test-'):
+                ancestors.append(parent)
+                parent = os.path.dirname(parent)
+            for ancestor in reversed(ancestors):
+                Windows.fix_appdata_acl(ancestor)
+            Windows.fix_appdata_acl(cls.tempdir)
+            Windows.fix_appdata_acl(bleachbit.options_dir)
         bleachbit.Options.options.reset_overrides()
         bleachbit.Options.options.set_override("first_start", False)
 
@@ -287,6 +303,7 @@ class BleachbitTestCase(unittest.TestCase):
         # tempdir while rmtree is mid-way through deleting it.
         bleachbit.Options.options.cancel_pending_flush()
         gc_collect()
+        close_delete_parent_lock()
         # Stop patching the options paths before rmtree to avoid a
         # potential flush into cls.tempdir while rmtree() is running
         # to avoid OSError [Errno 66] Directory not empty.
@@ -355,6 +372,8 @@ class BleachbitTestCase(unittest.TestCase):
         # WinError 32 in rmtree() in tearDownClass.
         basedir = os.path.join(os.path.dirname(__file__), '..')
         os.chdir(basedir)
+        # delete() keeps a lock on the last parent dir, blocking its removal
+        close_delete_parent_lock()
         # Cancel first: a deferred flush holds bleachbit.ini open, which
         # fails the remove below with WinError 32. Cancelling takes the
         # flush lock, so it also waits out a flush already running.
@@ -609,6 +628,61 @@ def put_env(key, val):
             del os.environ[key]
     else:
         os.environ[key] = val
+
+
+def skipIfMac(f):
+    """Skip unit test if running on macOS"""
+    return unittest.skipIf(bleachbit.IS_MAC, 'running on macOS')(f)
+
+
+class StatusCodeHandler(http.server.BaseHTTPRequestHandler):
+    """Reply with the HTTP status code named in the request path.
+
+    A request for /status/404 responds with 404. Serving the codes
+    locally keeps the tests off external services.
+    """
+
+    # do_GET is the handler name required by http.server
+    # pylint: disable-next=invalid-name
+    def do_GET(self):
+        try:
+            status_code = int(self.path.rsplit('/', 1)[-1])
+        except ValueError:
+            status_code = 400
+        body = b'BleachBit test server\n'
+        self.send_response(status_code)
+        self.send_header('Content-Type', 'text/plain')
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args):
+        """Silence the default per-request logging to stderr."""
+
+
+class LocalHTTPServer(http.server.ThreadingHTTPServer):
+    """Threading HTTP server that skips the reverse DNS lookup."""
+
+    def server_bind(self):
+        # HTTPServer.server_bind() calls socket.getfqdn(), a reverse DNS
+        # lookup that can stall on the macOS CI runner
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
+
+
+@contextlib.contextmanager
+def status_server():
+    """Serve /status/<code> on 127.0.0.1 and yield its URL template"""
+    httpd = LocalHTTPServer(('127.0.0.1', 0), StatusCodeHandler)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    try:
+        host, port = httpd.server_address[:2]
+        yield f'http://{host}:{port}/status/{{}}'
+    finally:
+        httpd.shutdown()
+        thread.join(timeout=5)
+        httpd.server_close()
 
 
 def skipIfWindows(f):

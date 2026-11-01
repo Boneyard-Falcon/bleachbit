@@ -12,7 +12,7 @@ import atexit
 import ctypes
 import errno
 import os
-import secrets
+import stat
 import string
 import struct
 import tempfile
@@ -58,6 +58,8 @@ WINDOWS_RESERVED_FILENAMES.update(
 
 def __random_string(length):
     """Return random alphanumeric characters of given length"""
+    # Keep secrets off the startup path: it drags in hmac and _hashlib
+    import secrets  # pylint: disable=import-outside-toplevel
     return ''.join(secrets.choice(FILENAME_CHARS)
                    for i in range(length))
 
@@ -102,8 +104,9 @@ def detect_orphaned_wipe_files(shred_drives=None):
     - Located in directories from options shred_drives
     - Filename starts with 'empty_'
     - Filename has >100 characters (due to random suffix)
-    - No file extension
     - Contains only null bytes when sampled
+
+    A dot does not rule a file out: the random suffix often contains one.
 
     Returns:
         list: Paths to detected orphaned wipe files
@@ -124,12 +127,10 @@ def detect_orphaned_wipe_files(shred_drives=None):
                 if not entry.is_file():
                     continue
                 filename = entry.name
-                # Check criteria: starts with 'empty_', >100 chars, no extension
+                # Check criteria: starts with 'empty_', >100 chars
                 if not filename.startswith('empty_'):
                     continue
                 if len(filename) <= 100:
-                    continue
-                if '.' in filename:
                     continue
                 # Read a small sample to check for null bytes
                 try:
@@ -200,26 +201,49 @@ def sync():
         ctypes.cdll.LoadLibrary('msvcrt.dll')._flushall()
 
 
-def wipe_write(path):
+def wipe_write(path, dir_fd=None):
     """Overwrite a file's contents with zeros without truncating it.
 
     Return the open file handle; the caller must close it."""
-    from bleachbit.FileUtilities import getsize, _open_nofollow_fd
-    size = getsize(path)
-    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    from bleachbit.FileUtilities import getsize, _islink, _open_nofollow_fd
+    size = getsize(path, dir_fd)
+    # O_TRUNC would free the blocks before any zeros land on them
+    flags = os.O_WRONLY
     try:
-        fd = _open_nofollow_fd(path, flags)
+        fd = _open_nofollow_fd(path, flags, dir_fd=dir_fd)
     except OSError as e:
         # Only retry on a genuine permission error; a symlink also raises
         # EACCES here, and chmod() on a symlink path follows it, which
         # would mutate an attacker-controlled target's permissions.
-        if e.errno == errno.EACCES and not os.path.islink(path):
-            os.chmod(path, 0o200)  # user write only
-            fd = _open_nofollow_fd(path, flags)
+        if e.errno == errno.EACCES and not _islink(path, dir_fd):
+            if dir_fd is None:
+                os.chmod(path, 0o200)  # user write only
+            else:
+                # Through a descriptor, so a link swapped in is not followed
+                try:
+                    chmod_fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW,
+                                       dir_fd=dir_fd)
+                except OSError:
+                    # Not readable either: fchmodat() without following a link
+                    try:
+                        os.chmod(path, 0o200, dir_fd=dir_fd,
+                                 follow_symlinks=False)
+                    except (NotImplementedError, ValueError):
+                        raise e from None
+                else:
+                    try:
+                        os.chmod(chmod_fd, 0o200)  # user write only
+                    finally:
+                        os.close(chmod_fd)
+            fd = _open_nofollow_fd(path, flags, dir_fd=dir_fd)
         else:
             raise
     f = os.fdopen(fd, 'wb')
     try:
+        if stat.S_ISBLK(os.fstat(fd).st_mode):
+            # getsize() is 0 for a device node, such as a swap partition
+            size = f.seek(0, os.SEEK_END)
+            f.seek(0)
         blanks = memoryview(ZERO_FILL_BUFFER)
         while size > 0:
             f.write(blanks[:min(size, WRITE_BUF_SIZE)])
@@ -232,13 +256,15 @@ def wipe_write(path):
     return f
 
 
-def wipe_contents(path):
+def wipe_contents(path, dir_fd=None):
     """Wipe files contents
 
     https://en.wikipedia.org/wiki/Data_remanence
     2006 NIST Special Publication 800-88 (p. 7): "Studies have
     shown that most of today's media can be effectively cleared
     by one overwrite"
+
+    dir_fd is POSIX only.
     """
     from bleachbit.FileUtilities import truncate_f
 
@@ -289,14 +315,14 @@ def wipe_contents(path):
             # pylint: disable-next=consider-using-with
             f = open(path, 'wb')
     else:
-        f = wipe_write(path)
+        f = wipe_write(path, dir_fd)
     try:
         truncate_f(f)
     finally:
         f.close()
 
 
-def wipe_name(pathname1):
+def wipe_name(pathname1, dir_fd=None):
     """Wipe the original filename and return the new pathname
 
     File systems vary in how they store a pathname and how they respond
@@ -306,8 +332,9 @@ def wipe_name(pathname1):
     This function tries to rename the file a single time to a random
     name with the identical length.
 
-
+    With dir_fd, both names are relative to that directory.
     """
+    from bleachbit.FileUtilities import _lexists
     (head, tail) = os.path.split(pathname1)
     target_length = len(tail)
     attempt_count = 0
@@ -321,10 +348,11 @@ def wipe_name(pathname1):
         if not __valid_random_filename(new_tail):
             continue
         pathname2 = os.path.join(head, new_tail)
-        if os.path.lexists(pathname2):
+        if _lexists(pathname2, dir_fd):
             continue
         try:
-            os.rename(pathname1, pathname2)
+            os.rename(pathname1, pathname2,
+                      src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
             break
         except OSError as e:
             if e.errno in (errno.EACCES, errno.EPERM, errno.EROFS):
@@ -386,12 +414,17 @@ def wipe_path(pathname, idle=False):
             tempfile.TMP_MAX = min(tmp_max_orig, 20)
         try:
             while True:
+                suffix = __random_string(maxlen)
+                # Windows drops a trailing dot from the name it creates, so
+                # f.name would not match the file and delete() would miss it
+                if not __valid_random_filename(suffix):
+                    continue
                 try:
                     # The temporary file outlives the retry loop and is deleted at exit.
                     # pylint: disable-next=consider-using-with
                     f = tempfile.NamedTemporaryFile(
                         dir=pathname,
-                        suffix=__random_string(maxlen),
+                        suffix=suffix,
                         delete=False,
                         prefix="empty_"
                     )
@@ -644,9 +677,10 @@ def wipe_path(pathname, idle=False):
                         logger.debug(
                             _("Encountered unknown error #0 while truncating file."))
                     time.sleep(0.1)
-            # explicitly delete
+            # Delete without shredding: the file holds only zeros, and after
+            # an abort it was not truncated, so shredding would rewrite it all.
             try:
-                delete(f.name, ignore_missing=True)
+                delete(f.name, allow_shred=False, ignore_missing=True)
             except Exception as e:
                 logger.error(
                     'After wiping, error deleting file %s: %s', f.name, e)

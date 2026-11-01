@@ -9,11 +9,11 @@ Test case for module Network
 """
 
 # standard imports
-import http.server
+import contextlib
+import errno
 import ipaddress
 import logging
 import os
-import threading
 import unittest
 import warnings
 from unittest.mock import MagicMock, Mock, patch
@@ -53,31 +53,6 @@ def response_to_error_msg(response):
            f"Response content: {response.text}"
 
 
-class _StatusCodeHandler(http.server.BaseHTTPRequestHandler):
-    """Reply with the HTTP status code named in the request path.
-
-    A request for /status/404 responds with 404. Serving the codes
-    locally keeps the tests off external services.
-    """
-
-    # do_GET is the handler name required by http.server
-    # pylint: disable-next=invalid-name
-    def do_GET(self):
-        try:
-            status_code = int(self.path.rsplit('/', 1)[-1])
-        except ValueError:
-            status_code = 400
-        body = b'BleachBit test server\n'
-        self.send_response(status_code)
-        self.send_header('Content-Type', 'text/plain')
-        self.send_header('Content-Length', str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-    def log_message(self, *args):
-        """Silence the default per-request logging to stderr."""
-
-
 class NetworkTestCase(common.BleachbitTestCase):
     """Test case for module Network"""
     status_generator_url = None
@@ -85,22 +60,11 @@ class NetworkTestCase(common.BleachbitTestCase):
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
-        cls._httpd = http.server.ThreadingHTTPServer(
-            ('127.0.0.1', 0), _StatusCodeHandler)
-        # tearDownClass is skipped when setUpClass raises
-        cls.addClassCleanup(cls._httpd.server_close)
-        cls._server_thread = threading.Thread(
-            target=cls._httpd.serve_forever, daemon=True)
-        cls._server_thread.start()
-        host, port = cls._httpd.server_address
-        cls.status_generator_url = f'http://{host}:{port}/status/{{}}'
+        # A class cleanup also runs when setUpClass raises
+        stack = contextlib.ExitStack()
+        cls.addClassCleanup(stack.close)
+        cls.status_generator_url = stack.enter_context(common.status_server())
         logger.info('Local status server: %s', cls.status_generator_url)
-
-    @classmethod
-    def tearDownClass(cls):
-        cls._httpd.shutdown()
-        cls._server_thread.join(timeout=5)
-        super().tearDownClass()
 
     def test_unset_sslkeylogfile(self):
         """Test the function unset_sslkeylogfile()."""
@@ -108,7 +72,9 @@ class NetworkTestCase(common.BleachbitTestCase):
             self.assertEqual(unset_sslkeylogfile(True), IS_WINDOWS)
             self.assertFalse(unset_sslkeylogfile(True))
 
-    def test_download_url_to_fn(self):
+    # Keep the retries but skip the backoff waits between them
+    @patch('urllib3.util.retry.Retry.sleep')
+    def test_download_url_to_fn(self, _mock_sleep):
         """Unit test for function download_url_to_fn()"""
         # Test different HTTP status codes
         # 200: success
@@ -165,13 +131,46 @@ class NetworkTestCase(common.BleachbitTestCase):
         fake_response = Mock()
         fake_response.status_code = 200
         fake_response.content = b'attacker payload'
+        on_error = Mock()
+        # The link is simulated, so delete() would remove the real file
         with patch('bleachbit.Network.fetch_url', return_value=fake_response), \
                 patch('bleachbit.FileUtilities.os.path.islink',
-                      side_effect=lambda p: p == filename):
-            with self.assertRaises(OSError):
-                download_url_to_fn('https://example.invalid/x', filename)
+                      side_effect=lambda p: p == filename), \
+                patch('bleachbit.Network.delete'):
+            self.assertFalse(download_url_to_fn(
+                'https://example.invalid/x', filename, on_error=on_error))
+        on_error.assert_called_once()
         with open(filename, encoding='utf-8') as f:
             self.assertEqual(f.read(), 'keepme')
+
+    def test_download_url_to_fn_write_error(self):
+        """A failed write returns False and leaves no partial file"""
+        fn = os.path.join(self.tempdir, 'partial')
+        fake_response = Mock()
+        fake_response.status_code = 200
+        fake_response.content = b'complete'
+        on_error = Mock()
+
+        def disk_full(path, mode):
+            with open(path, mode) as f:
+                f.write(b'part')
+            raise OSError(errno.ENOSPC, 'No space left on device')
+
+        with patch('bleachbit.Network.fetch_url', return_value=fake_response), \
+                patch('bleachbit.Network.open_for_overwrite', side_effect=disk_full):
+            self.assertFalse(download_url_to_fn(
+                'https://example.invalid/x', fn, on_error=on_error))
+        on_error.assert_called_once()
+        self.assertNotExists(fn)
+
+        # Partial file must still be deleted when on_error raises (e.g. update_winapp2)
+        on_error_raising = Mock(side_effect=RuntimeError('download failed'))
+        with patch('bleachbit.Network.fetch_url', return_value=fake_response), \
+                patch('bleachbit.Network.open_for_overwrite', side_effect=disk_full):
+            with self.assertRaises(RuntimeError):
+                download_url_to_fn(
+                    'https://example.invalid/x', fn, on_error=on_error_raising)
+        self.assertNotExists(fn)
 
     def test_get_gtk_version(self):
         """Unit test for get_gtk_version()"""
@@ -313,7 +312,8 @@ class NetworkTestCase(common.BleachbitTestCase):
         with self.assertRaises(requests.exceptions.RetryError):
             fetch_url(url, max_retries=1, timeout=5)
 
-    def test_fetch_url_invalid(self):
+    @patch('urllib3.util.retry.Retry.sleep')
+    def test_fetch_url_invalid(self, _mock_sleep):
         """Unit test for fetch_url() with invalid URL"""
         url = 'https://test.invalid'
         with self.assertRaises(requests.exceptions.RequestException):
